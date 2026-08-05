@@ -1,4 +1,3 @@
-<<<<<<< HEAD
 # 🍁 枫独 · OPC 经营助手
 
 **GOAI 世界人工智能开源大赛 · 无界应用｜BoundlessAgents · AI+金融 赛道**
@@ -41,12 +40,12 @@ python app.py
 > export MODELSCOPE_API_KEY=ms-xxx
 > ```
 
-### 部署到魔搭创空间（在线体验）
+### 在线体验
 
-1. 在魔搭创空间新建应用，镜像选择 `python`，**Gradio 版本选 6.x**（与代码兼容）
-2. 上传本目录全部文件（含 `assets/`）
-3. 环境变量：`MODELSCOPE_API_KEY`（可选）
-4. 部署后提交在线链接
+- **魔搭创空间**（在线运行）：https://modelscope.cn/studios/qingfengyuqing/fengdu
+- **代码仓库**：https://github.com/qingfengyu153781-star/fengdu-opc
+
+> 魔搭创空间为演示环境，首次访问可能需等待冷启动。
 
 ---
 
