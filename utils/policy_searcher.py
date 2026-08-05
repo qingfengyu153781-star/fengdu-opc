@@ -91,7 +91,133 @@ def _parse_baidu(html: str) -> list[dict]:
     return items[:8]
 
 
-# ---------- 真 API：Azure Bing Search（免费层 1000 次/月，稳定可作申请依据） ----------
+# ---------- 官方原文抓取增强（质量向人工搜索看齐的关键） ----------
+# 对命中「政府域名」的结果 fetch 正文，提取真实金额/资格/材料，替代"只有标题+摘要"。
+_GOV_DOMAIN = (".gov.cn", "gov.cn", "wenzhou.gov.cn", "zhengce.")
+_AMOUNT_RE = re.compile(r"[¥￥]?\s*([\d,]+(?:\.\d+)?)\s*(万|万元|元|块钱)")
+_ELIG_RE = re.compile(r"(毕业.{0,8}年|大学生|高校毕业生|个体工商户|小微企业|注册.{0,6}(?:满|超过|年)|正常经营|缴纳社保|社保|首次创业|带动就业)")
+
+
+def _fetch_policy_content(url: str) -> str | None:
+    """抓取政策页正文，去标签取文本。失败返回 None（静默，不影响搜索结果）。"""
+    try:
+        resp = requests.get(url, headers=HEADERS, timeout=6)
+        if resp.status_code != 200:
+            return None
+        resp.encoding = resp.apparent_encoding or "utf-8"
+        html = resp.text
+        # 去 script/style/标签 → 纯文本
+        html = re.sub(r"<script.*?</script>", "", html, flags=re.S)
+        html = re.sub(r"<style.*?</style>", "", html, flags=re.S)
+        text = re.sub(r"<[^>]+>", "", html)
+        text = re.sub(r"\s+", " ", text).strip()
+        return text[:4000]
+    except Exception:
+        return None
+
+
+def _extract_policy_detail(text: str) -> dict:
+    """从政策正文提取 {amount, eligibility, materials} 真实要素（不编造）。"""
+    if not text:
+        return {}
+    out = {}
+    # 金额
+    amounts = _AMOUNT_RE.findall(text)
+    if amounts:
+        out["amount"] = " / ".join(
+            f"{a[0]}{a[1]}" for a in amounts[:3])[:80]
+    # 资格条件（提取含关键条件的句子）
+    els = []
+    for m in re.finditer(r"[^。；;]{6,40}?(?:毕业|大学生|高校|个体|小微|注册|社保|创业|就业)[^。；;]{0,30}", text):
+        s = m.group(0).strip()
+        if len(s) > 8 and s not in els:
+            els.append(s)
+        if len(els) >= 4:
+            break
+    if els:
+        out["eligibility"] = els[:4]
+    # 材料（含"身份证/营业执照/证明/申请表"的片段）
+    mats = []
+    for kw in ("身份证", "营业执照", "毕业证", "学历", "申请表", "社保", "证明", "合同", "发票"):
+        if kw in text:
+            mats.append(kw)
+    if mats:
+        out["materials"] = mats[:6]
+    return out
+
+
+def _enrich_with_content(results: list[dict]) -> list[dict]:
+    """对官方/信息平台来源（前 3 条）抓正文补强金额/资格/材料。
+
+    只对政府域名做，避免抓营销站。抓取失败静默跳过（不阻塞、不白屏）。
+    """
+    enriched = []
+    for i, r in enumerate(results):
+        r = dict(r)
+        url = r.get("url", "")
+        if i < 3 and ".gov.cn" in url and r.get("official") == "官方":
+            content = _fetch_policy_content(url)
+            detail = _extract_policy_detail(content or "")
+            if detail:
+                r["detail"] = detail
+        enriched.append(r)
+    return enriched
+
+
+def search_and_format(region: str, keyword: str = None) -> str:
+    """搜索当地政策 → 格式化成报告段落。keyword 可指定搜索类目（动态搜索词）。失败返回空串。"""
+    results = search_policies(region, keyword or "创业补贴 政策")
+    if not results:
+        return ""
+    results = _enrich_with_content(results[:6])
+    lines = [f"\n🔍 **实时搜索「{region}」相关政策**（来源：网页搜索结果，官方优先，需点开核验）："]
+    for r in results[:6]:
+        tag = {"官方": "🏛 官方", "信息平台": "📄 信息平台", "需核验": "🔗 第三方"}.get(r.get("official"), "")
+        line = f"- {tag} **{r['title']}**\n  · [查看来源]({r['url']})"
+        if r.get("snippet"):
+            line += f"\n  · {r['snippet']}"
+        # 官方原文抓取到的真实要素（质量增强）
+        detail = r.get("detail", {})
+        if detail.get("amount"):
+            line += f"\n  · 💰 {detail['amount']}"
+        if detail.get("eligibility"):
+            line += f"\n  · ✅ 资格：{'；'.join(detail['eligibility'][:2])}"
+        if detail.get("materials"):
+            line += f"\n  · 📋 材料：{'、'.join(detail['materials'])}"
+        lines.append(line)
+    lines.append("\n> 以上为搜索引擎实时结果，🏛官方来源可作申请依据；💰/✅/📋 为抓取原文提炼，具体以官方最新文件为准。")
+    return "\n".join(lines)
+
+
+# ---------- SearXNG：开源自托管元搜索（GitHub 正解，可绕过反爬限流） ----------
+# 配置 SEARXNG_URL（如 http://127.0.0.1:8080）即启用。
+# SearXNG 聚合百度/Bing/360/搜狗/知乎/B站等引擎，由服务器代为请求 → 稳定、无单源限流。
+def _search_searxng(query: str, limit: int = 8) -> list[dict]:
+    url = os.getenv("SEARXNG_URL", "").strip().rstrip("/")
+    if not url:
+        return []
+    try:
+        resp = requests.get(
+            f"{url}/search",
+            params={"q": query, "format": "json", "language": "zh-CN"},
+            headers={"User-Agent": HEADERS["User-Agent"]},
+            timeout=TIMEOUT,
+        )
+        if resp.status_code != 200:
+            return []
+        data = resp.json()
+        out = []
+        for item in data.get("results", [])[:limit]:
+            out.append({
+                "title": _clean(item.get("title", "")),
+                "url": item.get("url", ""),
+                "snippet": _clean(item.get("content", "") or item.get("snippet", "")),
+            })
+        return out
+    except Exception:
+        return []
+
+
 def _search_bing_api(query: str, limit: int = 8) -> list[dict]:
     """Bing Web Search API v7（需 BING_SEARCH_API_KEY）。返回 [{title,url,snippet}]。"""
     key = os.getenv("BING_SEARCH_API_KEY", "").strip()
@@ -163,8 +289,25 @@ def _search_baidu(query: str) -> list[dict]:
     return _parse_baidu(html) if html else []
 
 
+_POLICY_WORDS = ("补贴", "创业", "就业", "优惠", "减免", "资助", "奖励", "支持",
+                 "政策", "申报", "认定", "扶持", "减免税", "人才", "大学生")
+
+
+def _is_policy_relevant(r: dict) -> bool:
+    """判断结果是否与政策相关（标题/摘要命中政策词）。
+
+    用作排序权重（不硬剔除——免费引擎结果少，剔除会误伤"有结果"）。
+    政策词命中的排前面，纯百科/景点等压后但不删。
+    """
+    text = (r.get("title", "") + " " + r.get("snippet", ""))
+    return any(k in text for k in _POLICY_WORDS)
+
+
 def _merge_dedup(results: list[dict], limit: int = 8) -> list[dict]:
-    """多源结果按 URL 去重（保留首个）+ 垃圾站过滤，再按来源分级排序。"""
+    """多源结果按 URL 去重 + 垃圾站过滤，再按来源分级 + 政策相关性排序。
+
+    排序：官方且政策相关 → 官方 → 信息平台 → 需核验。不硬剔相关性（保可用性）。
+    """
     seen, merged = set(), []
     for r in results:
         url = r.get("url", "")
@@ -172,7 +315,11 @@ def _merge_dedup(results: list[dict], limit: int = 8) -> list[dict]:
             continue
         seen.add(url)
         merged.append(r)
-    return _rank_results(merged)[:limit]
+    # 先打来源标签（rank_results 负责），再按"官方优先 + 政策相关优先"排序
+    tagged = _rank_results(merged)
+    tagged.sort(key=lambda r: (_SORT_ORDER.get(r.get("official"), 2),
+                               0 if _is_policy_relevant(r) else 1))
+    return tagged[:limit]
 
 
 def _search_all(query: str) -> list[dict]:
@@ -201,18 +348,23 @@ def search_web(query: str) -> list[dict]:
       3. 主 query 全失败 → 简化 query 重试（去掉"官方/2026"限定词），
          提高被限流/复杂 query 时的命中率
     """
-    # 档位1：真搜索 API
+    # 档位1：真搜索 API（配 BING_SEARCH_API_KEY 时）
     api_results = _search_bing_api(query)
     if api_results:
         return _rank_results([r for r in api_results if not _is_junk(r)])
 
-    # 档位2：三源免费爬虫合并
+    # 档位2：SearXNG 自托管元搜索（配 SEARXNG_URL 时，GitHub 正解）
+    sx_results = _search_searxng(query)
+    if sx_results:
+        return _merge_dedup(sx_results)
+
+    # 档位3：三源免费爬虫合并
     merged = _merge_dedup(_search_all(query))
     if merged:
         return merged
 
     # 档位3：简化 query 重试（防复杂 query / 限流）
-    simple = re.sub(r"\s*(官方|2026)\s*", " ", query).strip()
+    simple = re.sub(r"\s*2026\s*", " ", query).strip()
     if simple and simple != query:
         merged2 = _merge_dedup(_search_all(simple))
         if merged2:
@@ -226,7 +378,9 @@ _SORT_ORDER = {"官方": 0, "信息平台": 1, "需核验": 2}
 
 # 垃圾站黑名单（标题/域名命中即丢弃，防止营销/低质站污染首屏）
 _JUNK_KEYWORDS = ("黑料", "爆料", "正能量", "福利", "小视频", "成人", "博彩",
-                  "棋牌", "交友", "兼职刷单", "低价代开", "黄页", "站群")
+                  "棋牌", "交友", "兼职刷单", "低价代开", "黄页", "站群",
+                  "服饰", "时尚", "女装", "男装", "鞋", "包包", "化妆品", "母婴",
+                  "H&M", "zara", "拼多多店铺", "加盟", "微商")
 
 
 def _is_junk(result: dict) -> bool:
@@ -263,9 +417,10 @@ def _rank_results(results: list[dict]) -> list[dict]:
 def search_policies(region: str, keyword: str = "创业补贴 政策") -> list[dict]:
     """实时搜索当地政策。多源尝试，返回 [{title, url, snippet, official}] 或空列表。
 
-    query 带「官方」限定词：引导搜索引擎优先返回政府门户/官方公告，提升结果质量。
+    query 用精准政策词（不带"官方"——那会被引擎理解成"找官网首页"，
+    反而搜不到政策原文；精确词才能命中"一次性创业补贴通知"类政策页）。
     """
-    query = f"{region} {keyword} 官方 申请条件 2026"
+    query = f"{region} {keyword} 申请条件 2026"
     return search_web(query)
 
 
@@ -315,22 +470,6 @@ def format_unavailable(query: str) -> str:
     """合规问答场景的联网不可用提示。"""
     return (f"\n⚠️ 当前网络环境无法实时联网搜索（网络受限或搜索源不可达）。"
             f"以上回答基于本地知识库，具体以官方最新文件为准。")
-
-
-def search_and_format(region: str, keyword: str = None) -> str:
-    """搜索当地政策 → 格式化成报告段落。keyword 可指定搜索类目（动态搜索词）。失败返回空串。"""
-    results = search_policies(region, keyword or "创业补贴 政策")
-    if not results:
-        return ""
-    lines = [f"\n🔍 **实时搜索「{region}」相关政策**（来源：网页搜索结果，官方优先，需点开核验）："]
-    for r in results[:6]:
-        tag = {"官方": "🏛 官方", "信息平台": "📄 信息平台", "需核验": "🔗 第三方"}.get(r.get("official"), "")
-        line = f"- {tag} **{r['title']}**\n  · [查看来源]({r['url']})"
-        if r.get("snippet"):
-            line += f"\n  · {r['snippet']}"
-        lines.append(line)
-    lines.append("\n> 以上为搜索引擎实时结果，🏛官方来源可作申请依据；📄/🔗 为信息平台或第三方，具体申请条件/金额以官方最新文件为准。")
-    return "\n".join(lines)
 
 
 def format_web_search(query: str, limit: int = 5) -> str:
