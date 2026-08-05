@@ -414,14 +414,52 @@ def _rank_results(results: list[dict]) -> list[dict]:
     return results
 
 
-def search_policies(region: str, keyword: str = "创业补贴 政策") -> list[dict]:
-    """实时搜索当地政策。多源尝试，返回 [{title, url, snippet, official}] 或空列表。
+def _query_variant(region: str, keyword: str, round_no: int) -> str:
+    """生成第 round_no 轮的搜索词变体。
 
-    query 用精准政策词（不带"官方"——那会被引擎理解成"找官网首页"，
-    反而搜不到政策原文；精确词才能命中"一次性创业补贴通知"类政策页）。
+    第 1 轮用主词（可能是行业动态词）；后续轮换更精准的政策措辞，
+    覆盖"一次性创业补贴 / 就业创业补贴 / 材料"等不同表述，提高命中政策原文概率。
     """
-    query = f"{region} {keyword} 申请条件 2026"
-    return search_web(query)
+    k = keyword or "创业补贴 政策"
+    if round_no == 0:
+        return f"{region} {k} 申请条件 2026"
+    if round_no == 1:
+        return f"{region} 一次性创业补贴 申请 通知 2026"
+    if round_no == 2:
+        return f"{region} 就业创业 补贴 政策 材料 2026"
+    return f"{region} 创业扶持 补贴 政策 文件 2026"
+
+
+def search_policies(region: str, keyword: str = "创业补贴 政策",
+                    max_rounds: int | None = None) -> list[dict]:
+    """实时搜索当地政策（自适应补搜，卖点：问就有 + 有质）。
+
+    首轮搜出后统计"政策相关"条数：若不足目标（3 条），自动换更精准的政策词
+    再搜，累积合并去重，直到政策相关达标或达 max_rounds 轮。
+    返回 [{title, url, snippet, official}]。
+
+    max_rounds：
+    - None（默认）：自动——配了真后端（BING_API_KEY/SEARXNG_URL）时补搜到
+      精准为止（免费爬虫对精准词命中差，补搜收益低且拖慢演示）；
+      纯免费爬虫时只用 1 轮（保"有结果 + 快"）。
+    """
+    use_backend = bool(os.getenv("BING_SEARCH_API_KEY")) or bool(os.getenv("SEARXNG_URL"))
+    rounds = max_rounds if max_rounds is not None else (3 if use_backend else 1)
+
+    target = 3  # 政策相关结果达到 3 条即停止补搜
+    all_results: list[dict] = []
+    for rnd in range(rounds):
+        query = _query_variant(region, keyword, rnd)
+        res = search_web(query)
+        if res:
+            all_results.extend(res)
+        # 累积去重 + 排序后，统计政策相关数
+        merged = _merge_dedup(all_results)
+        relevant = [r for r in merged if _is_policy_relevant(r)]
+        # 达标即提前结束（快路径）；不足则补搜（慢路径）
+        if len(relevant) >= target:
+            return merged
+    return _merge_dedup(all_results)
 
 
 def _policy_query_for(profile: dict, region: str) -> str:

@@ -1,5 +1,9 @@
 # 🍁 枫独 · OPC 经营助手
 
+> ⚖️ **评委请查阅**：**`FOR_JUDGES_PROJECT_SUMMARY.md`（项目一页纸）** —— 目标用户/核心问题/核心流程/安全合规边界速览。
+
+
+
 **GOAI 世界人工智能开源大赛 · 无界应用｜BoundlessAgents · AI+金融 赛道**
 
 面向一人公司（OPC = One Person Company）的经营辅助 Agent。让一个没有任何财务/法务背景的普通人，也能像有专属顾问一样把公司开明白。

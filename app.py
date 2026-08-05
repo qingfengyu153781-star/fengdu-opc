@@ -42,9 +42,10 @@ def _asset_b64(filename: str) -> str:
     return f"data:{mime};base64,{b64}"
 
 
-LOGO_B64 = _asset_b64("logo.png")
-BANNER_B64 = _asset_b64("banner.png")
-BG_B64 = _asset_b64("bg.png")
+LOGO_B64 = _asset_b64("logo.webp") or _asset_b64("logo.png")
+BANNER_B64 = _asset_b64("banner.webp") or _asset_b64("banner.png")
+# bg.png 1.66MB 仅作全页背景 → 删除，用 CSS 纯色 BG 替代（视觉一致，省 1.66MB）
+BG_B64 = ""
 # 地区横幅用压缩版（2KB，可安全放进 CSS background）
 REGION_BANNER_B64 = _asset_b64("region_banner_small.webp") or _asset_b64("region_banner.png")
 
@@ -64,6 +65,57 @@ COCKPIT_DEEP = "#8A3D24"     # 橙红加深（进度条轨道/卡片底）
 COCKPIT_BORDER = "#E08A5E"   # 橙红亮边
 BUBBLE_USER = "#F6CBA6"      # 用户气泡：浅杏橙
 BUBBLE_AI = "#FCE7D2"        # AI 气泡：偏白橙红
+
+# ---------------------------------------------------------------- 高对比主题（备用版：投影仪专用）
+# 决赛投影仪高光下，暖橙主题易泛白 → 用 UI_THEME=high_contrast 切换成纯白底黑字高对比版。
+# 平时默认暖橙主版，投影糊了再切换。同一份代码，两套主题，互不影响。
+HC_BG = "#FFFFFF"            # 纯白背景
+HC_TEXT = "#000000"          # 纯黑文字
+HC_ACCENT = "#0052CC"        # 蓝色强调（可读性最高的强调色）
+HC_PANEL = "#F5F5F5"         # 浅灰面板（组件底，对比清晰）
+HC_BORDER = "#888888"        # 中等灰边框
+HC_RED = "#CC0000"          # 风险红
+
+HC_CSS = f"""
+:root {{ --hc-bg: {HC_BG}; --hc-text: {HC_TEXT}; --hc-accent: {HC_ACCENT}; }}
+html {{ background: #ffffff !important; }}
+body {{ background: #ffffff !important; color: #000000 !important;
+  font-family: "Microsoft YaHei", sans-serif; }}
+gradio-app, .gradio-app, .gradio-container {{ background: #ffffff !important; max-width: 100% !important; }}
+#full-bg {{ display: none !important; }}   /* 隐藏背景图，纯白更清晰 */
+#brand-bar {{ background: #0052CC !important; color: #fff !important; }}
+.gradio-container label, .gradio-container .block, .gradio-container .form,
+.gradio-container textarea, .gradio-container input[type="text"],
+.gradio-container select {{ background: #ffffff !important; color: #000000 !important;
+  border: 2px solid #444444 !important; border-radius: 8px !important; }}
+.gradio-container [role="tab"] {{ color: #000000 !important; font-weight: 700 !important; }}
+.gradio-container [role="tab"].selected {{ background: #0052CC !important; color: #ffffff !important; }}
+.gradio-container .tabitem {{ background: #ffffff !important; border: 2px solid #aaaaaa !important; }}
+.gradio-container .prose, .gradio-container .markdown,
+.gradio-container .prose :is(p, h1, h2, h3, h4, ul, ol, li, strong, em, span, blockquote, code) {{
+  color: #000000 !important; }}
+.message-row.bubble.bot-row .bot.message,
+.message-row.bubble.user-row .user.message {{ background: #f5f5f5 !important; color: #000000 !important;
+  border: 2px solid #666666 !important; }}
+/* 驾驶舱：白底黑字高对比 */
+.cockpit {{ background: #ffffff !important; color: #000000 !important; border: 3px solid #000000 !important; }}
+.cockpit-head {{ color: #0052CC !important; border-bottom: 2px solid #000000 !important; }}
+.metric .big {{ color: #000000 !important; font-weight: 800 !important; }}
+.gold {{ color: #0052CC !important; }}
+.risk-low {{ color: #006600 !important; }} .risk-mid {{ color: #B26A00 !important; }} .risk-high {{ color: #CC0000 !important; }}
+#maple-btn {{ background: #0052CC !important; color: #fff !important; font-weight: 700 !important; }}
+#reset-btn {{ background: #666666 !important; color: #fff !important; }}
+#prefill-btn {{ background: #0052CC !important; color: #fff !important; }}
+.gradio-container .prose a {{ color: #0052CC !important; font-weight: 700 !important; }}
+.bar {{ background: #e0e0e0 !important; }}
+.bar-fill {{ background: #0052CC !important; color: #fff !important; }}
+.gradio-container footer, .gradio-container > footer,
+footer[aria-label="Gradio footer navigation"] {{ display: none !important; }}
+"""
+
+# 主题选择：UI_THEME=high_contrast → 高对比投影版；否则默认暖橙主版
+import os as _os
+USE_HC = _os.getenv("UI_THEME", "") == "high_contrast"
 
 # ---------------------------------------------------------------- CSS（浅暖橙红系）
 # 全页背景改为纯色（bg 图由 HTML img 层负责，避免 CSS base64 膨胀）
@@ -407,7 +459,8 @@ def render_cockpit(profile: dict, region: str, indices: dict | None = None,
             f" <span class='{status_cls}' style='font-size:11px'>（{status_txt}）</span>")
 
     if partial or indices is None:
-        filled = sum(1 for k, v in profile.items() if v)
+        filled = sum(1 for k, v in profile.items()
+                     if not k.startswith("_") and v not in (None, "", [], {}))
         total = len(bp.FIELD_KEYS)
         pct = round(filled / total * 100)
         return f"""
@@ -624,12 +677,48 @@ def process_chat(user_text: str, profile: dict, chat: list, region: str):
     region_val = profile["region"]
 
     if not bp.is_complete(profile):
-        q = bp.next_question(profile)
-        # LLM 可用时润色问题，否则用规则问题（问题自带选项提示）
-        question = polish_question(q, profile) if api_client.is_api_available() else q
-        chat.append({"role": "assistant", "content": f"🤔 {question}"})
+        # ---- 追问防死循环：同字段问满 3 次自动跳过；全部跳过则进诊断 ----
+        prof_ask = dict(profile.get("_ask_count", {}))
+        prof_skip = set(profile.get("_skip_fields", []))
+        # 本轮有进展（抽到新字段）→ 重置该字段计数（正常作答不算重复问）
+        if new_keys:
+            for k in new_keys:
+                prof_ask.pop(k, None)
+        # 找一个"未跳过 3 次"的缺失字段来问
+        target_key = None
+        for f in bp.missing_fields(profile):
+            if f["key"] not in prof_skip:
+                target_key = f["key"]
+                break
+        if target_key is not None:
+            prof_ask[target_key] = prof_ask.get(target_key, 0) + 1
+            if prof_ask[target_key] >= 3:
+                # 问满 3 次仍无进展 → 标记跳过，本轮先提示再问下一个
+                prof_skip.add(target_key)
+                prof_ask.pop(target_key, None)
+                chat.append({"role": "assistant",
+                             "content": f"▶️ 这个信息可以先跳过（已问多次未获有效回答），继续下一个问题。"})
+                # 重新找下一个未跳过的字段
+                target_key = None
+                for f in bp.missing_fields(profile):
+                    if f["key"] not in prof_skip:
+                        target_key = f["key"]
+                        break
+        if target_key is not None:
+            q = next(f["ask"] for f in bp.FIELDS if f["key"] == target_key)
+            question = polish_question(q, profile) if api_client.is_api_available() else q
+            chat.append({"role": "assistant", "content": f"🤔 {question}"})
+        else:
+            # 必填字段全部被跳过 → 不无限追问，直接出部分结果
+            chat.append({"role": "assistant",
+                         "content": "已收集到能收集的信息，为你生成当前可判断的结果…"})
+            profile["_pending_complete"] = True
+        profile["_ask_count"] = prof_ask
+        profile["_skip_fields"] = sorted(prof_skip)
         cockpit = render_cockpit(profile, region_out, partial=True)
-        status = f"⏳ 已收集 {sum(1 for v in profile.values() if v)}/{len(bp.FIELD_KEYS)} 项 · 回答上方的 AI 问题继续"
+        filled = sum(1 for k, v in profile.items()
+                     if not k.startswith("_") and v not in (None, "", [], {}))
+        status = f"⏳ 已收集 {filled}/{len(bp.FIELD_KEYS)} 项 · 回答上方的 AI 问题继续"
         return "", profile, region_out, chat, cockpit, status
 
     # 完整 → 匹配 + 诊断（一律用 region code 匹配政策库，profile['region'] 仅中文展示用）
@@ -1267,7 +1356,12 @@ def build_ui():
 if __name__ == "__main__":
     demo = build_ui()
     # Gradio 6.x：css/theme 移到 launch()
-    theme = gr.themes.Base(primary_hue="orange", neutral_hue="stone",
+    # 主题：默认暖橙主版；UI_THEME=high_contrast → 高对比投影备选版（决赛投影仪糊了时切换）
+    if USE_HC:
+        active_css, hue = HC_CSS, "blue"
+    else:
+        active_css, hue = CSS, "orange"
+    theme = gr.themes.Base(primary_hue=hue, neutral_hue="stone",
                            font=["Microsoft YaHei", "sans-serif"])
     demo.launch(server_name="0.0.0.0", server_port=7860, show_error=True,
-                css=CSS, theme=theme)
+                css=active_css, theme=theme)
