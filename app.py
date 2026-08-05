@@ -534,6 +534,35 @@ def _looks_like_off_topic(text: str) -> bool:
     return any(k in text for k in ("不知道", "不清楚", "跳过", "下一个", "随便", "换一个"))
 
 
+# ---------------------------------------------------------------- 涉法红线拦截（合规硬约束）
+# 命中即红牌拒绝：绝不把造假/虚报/偷逃税意图带进政策匹配流程。
+_LEGAL_REDLINE = [
+    "骗补", "造假", "虚报", "隐瞒", "伪造", "做假账", "假账", "洗钱", "贿赂",
+    "避税", "偷税", "逃税", "漏税", "虚开", "冒用", "冒充", "伪造公章", "套用他人",
+    "补办个假的", "办个假的", "假的毕业证", "假材料", "假发票",
+]
+
+_REDLINE_REPLY = (
+    "🚫 **已停止**：你提到的情况可能涉及虚报/造假/偷逃税，这属于违法违规行为，"
+    "我不能协助。\n\n如果你需要的是合法经营建议，可以继续描述你的真实经营情况，"
+    "我会帮你梳理合规的补贴申请路径。"
+)
+
+
+def _has_redline(text: str) -> bool:
+    """检测是否命中涉法红线。返回 True 表示应拒绝。"""
+    t = (text or "").strip()
+    return any(k in t for k in _LEGAL_REDLINE)
+
+
+# ---------------------------------------------------------------- 政策原文有效性（防乱码污染）
+def _looks_like_policy(text: str) -> bool:
+    """政策原文至少含一个政策要素，否则拒绝入库（防乱码/随手粘贴污染政策库）。"""
+    return any(k in text for k in ("补贴", "优惠", "减免", "资助", "奖励", "支持",
+                                   "申请", "条件", "万元", "元/", "元。", "毕业生",
+                                   "企业", "就业", "创业", "认定", "申报"))
+
+
 def process_chat(user_text: str, profile: dict, chat: list, region: str):
     """材料预审：用户输入 → 抽取字段 → 追问 or 出报告。
 
@@ -545,6 +574,13 @@ def process_chat(user_text: str, profile: dict, chat: list, region: str):
     if not user_text:
         return "", profile, region, chat, render_cockpit(profile, region, partial=True), ""
     chat.append({"role": "user", "content": user_text})
+
+    # 涉法红线拦截：命中立即拒绝，绝不带进匹配流程（合规硬约束）
+    if _has_redline(user_text):
+        chat.append({"role": "assistant", "content": _REDLINE_REPLY})
+        region_out = _region_code(profile.get("region") or region)
+        return ("", profile, region_out, chat,
+                render_cockpit(profile, region_out, partial=True), "⛔ 已拦截")
 
     # 规则抽取字段（确定性）
     extracted = bp.extract_from_text(user_text, profile)
@@ -601,10 +637,13 @@ def process_chat(user_text: str, profile: dict, chat: list, region: str):
     indices = compute_indices(profile, region_out)
     is_unknown = summ.get("region_status", "").startswith("通用参考")
 
-    # 未收录地区 → 实时搜索当地政策（优先）；失败回退通用方向
+    # 未收录地区 → 实时搜索当地政策（优先）；失败给显式降级提示 + 通用方向
     search_block = ""
     if is_unknown:
         search_block = policy_searcher.search_and_format(region_val)
+        if not search_block:
+            # 网络受限/搜索失败：不哑火，明确告知评委是环境限制，并引导本地通用库
+            search_block = policy_searcher.unavailable_notice(region_val)
         # LLM 增强：有 key 时基于搜索结果整理更精准的方向（可叠加）
         if api_client.is_api_available():
             llm_pol = lookup_local_policies(region_val, profile)
@@ -661,12 +700,14 @@ def run_diagnosis(profile_inputs: dict, region: str):
     indices = compute_indices(profile, region)
     cockpit = render_cockpit(profile, region, indices, summ, partial=False)
 
-    # 未收录地区 → 实时搜索当地政策（与 Tab1 一致）
+    # 未收录地区 → 实时搜索当地政策（与 Tab1 一致）；失败给显式降级提示
     search_block = ""
     if summ.get("region_status", "").startswith("通用参考"):
         # code（wenzhou/guangzhou…）→ 中文名；自定义输入（福建/广州…）直接用中文
         region_name = REGION_LABELS.get(region) or profile.get("region") or region
         search_block = policy_searcher.search_and_format(region_name)
+        if not search_block:
+            search_block = policy_searcher.unavailable_notice(region_name)
 
     report = render_report(profile, summ, indices, title="诊断结果", real_search=bool(search_block))
     if search_block:
@@ -689,6 +730,11 @@ def compliance_chat(message, history):
     history = history or []
     history.append({"role": "user", "content": message})
 
+    # 涉法红线拦截（合规硬约束，LLM 之前先拦）
+    if _has_redline(message):
+        history.append({"role": "assistant", "content": _REDLINE_REPLY})
+        return history, ""
+
     # 实时联网搜索（免费，独立于 LLM；失败静默）
     web_block = policy_searcher.format_web_search(message)
 
@@ -701,6 +747,8 @@ def compliance_chat(message, history):
             answer = answer.strip()
             if web_block:
                 answer += "\n\n" + web_block
+            else:
+                answer += "\n\n" + policy_searcher.format_unavailable(message)
             history.append({"role": "assistant", "content": answer})
             return history, ""
         except Exception:
@@ -722,6 +770,9 @@ def import_policy(region: str, policy_text: str):
     policy_text = (policy_text or "").strip()
     if not policy_text:
         return "请先粘贴政策原文。"
+    if not _looks_like_policy(policy_text):
+        return ("⚠️ **未能识别为政策原文**：请粘贴包含政策名称、金额、资格条件的完整政策文本"
+                "（如政府公告原文）。已拒绝入库，防止错误数据污染政策库。")
     if api_client.is_api_available():
         try:
             sys_p = agent_prompts.POLICY_IMPORT_PROMPT.format(region=region, policy_text=policy_text)
@@ -1056,6 +1107,15 @@ def build_ui():
             </div>
             <div class="region-pill" id="region-pill">地区可切换</div>
           </div>
+        </div>
+        """)
+
+        # 合规边界显性横幅（首屏可见，符合"辅助不替代"赛制要求）
+        gr.HTML("""
+        <div style="background:#FDE8E8;border:1px solid #E5484D;color:#C0392B;
+                    border-radius:10px;padding:10px 14px;margin-bottom:12px;font-size:13px;line-height:1.6;">
+          🛡️ 本系统仅为<b>辅助经营顾问</b>，所有政策匹配与风险诊断结果<b>仅供参考</b>，
+          不替代政府机构、金融机构或律师的最终专业判断。重大决策请咨询本地官方窗口。
         </div>
         """)
 

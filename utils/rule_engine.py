@@ -22,6 +22,14 @@ CURRENT_YEAR = 2026
 
 from policies import all_policies, region_info
 
+# 政策库经人工核实的地区 code（数据可作正式申请依据）。
+# 未在其中的地区（自助导入/占位）→ 地区政策仅作"待核实参考"，不纳入政策机会指数与材料清单。
+VERIFIED_REGIONS = {"wenzhou"}
+
+
+def _is_verified(region: str) -> bool:
+    return region in VERIFIED_REGIONS
+
 
 # ---------- 工具函数 ----------
 def _to_num(text) -> float | None:
@@ -331,6 +339,21 @@ def match_policies(profile: dict, region: str = "wenzhou", include_national: boo
 
     results = []
     for pol in pool:
+        # 隔离层：未核实地区的地区政策（非国家级）永远不进入 match，
+        # 仅作"待核实参考"展示 → 政策机会指数/材料清单都不会被未核实数据污染。
+        if pol.get("region") != "national" and not _is_verified(region):
+            results.append({
+                "policy": pol,
+                "status": "unknown",
+                "matched_conditions": [],
+                "unmet_conditions": [],
+                "pending_conditions": [{
+                    "condition": "该地区政策数据为自助导入/占位，未人工核实",
+                    "reason": "导入数据·待核实，不纳入正式申请匹配（保证零造假）",
+                }],
+            })
+            continue
+
         matched, unmet, pending = [], [], []
         for cond in pol["eligibility"]:
             status, reason = _check_condition(cond, profile)
@@ -434,6 +457,8 @@ def build_checklist(profile: dict, region: str) -> list[dict]:
             continue  # 不列被资格否决政策的要求
         if mr["policy"].get("region") == "general":
             continue  # 通用参考政策不列材料（不代表当地一定有）
+        if mr["policy"].get("region") != "national" and not _is_verified(region):
+            continue  # 隔离层：未核实地区政策不列材料（零造假，防止错误数据污染清单）
         for mat in mr["policy"]["materials"]:
             key = mat["name"]
             norm = _norm_material(key)

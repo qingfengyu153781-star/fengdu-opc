@@ -96,21 +96,72 @@ def _search_baidu(query: str) -> list[dict]:
 
 
 def search_web(query: str) -> list[dict]:
-    """通用实时搜索。多源尝试，返回 [{title, url, snippet}] 或空列表。"""
+    """通用实时搜索。多源尝试，返回 [{title, url, snippet, official}] 或空列表。"""
     for fn in (_search_bing, _search_ddg, _search_baidu):
         try:
             res = fn(query)
             if res:
-                return res
+                return _rank_results(res)
         except Exception:
             continue
     return []
 
 
+# ---------- 来源分级（搜索质量是卖点：官方优先、可溯源） ----------
+_SORT_ORDER = {"官方": 0, "信息平台": 1, "需核验": 2}
+
+
+def _classify_source(url: str) -> str:
+    """按域名给来源分级：官方 / 信息平台 / 需核验。
+
+    - 官方：政府门户 / .gov.cn（可溯源第一优先级）
+    - 信息平台：本地宝 / 12333 人社站 / 人才网（内容常用但非官方口径）
+    - 需核验：其余第三方站（营销/自媒体，展示时提示）
+    """
+    u = (url or "").lower()
+    if ".gov.cn" in u or ".gov/" in u or u.startswith("https://www.gov."):
+        return "官方"
+    if any(h in u for h in ("bendibao", "12333", "wzrc", "hrss")):
+        return "信息平台"
+    return "需核验"
+
+
+def _rank_results(results: list[dict]) -> list[dict]:
+    """按来源分级排序（官方置顶），并为每条打上 official 标签。"""
+    for r in results:
+        r["official"] = _classify_source(r.get("url", ""))
+        r["_sort"] = _SORT_ORDER.get(r["official"], 2)
+    results.sort(key=lambda x: x["_sort"])
+    for r in results:
+        r.pop("_sort", None)
+    return results
+
+
 def search_policies(region: str, keyword: str = "创业补贴 政策") -> list[dict]:
-    """实时搜索当地政策。多源尝试，返回 [{title, url, snippet}] 或空列表。"""
-    query = f"{region} {keyword} 申请条件 2026"
+    """实时搜索当地政策。多源尝试，返回 [{title, url, snippet, official}] 或空列表。
+
+    query 带「官方」限定词：引导搜索引擎优先返回政府门户/官方公告，提升结果质量。
+    """
+    query = f"{region} {keyword} 官方 申请条件 2026"
     return search_web(query)
+
+
+def unavailable_notice(region: str) -> str:
+    """实时搜索不可用时的显式提示（网络受限降级文案，不哑火）。
+
+    用途：创空间/办公网可能限制外网，此时明确告知评委"是网络限制、非功能缺失"，
+    并引导到本地通用政策库，保证演示不断片。
+    """
+    return (f"\n⚠️ 当前网络环境无法实时抓取「{region}」政策"
+            f"（创空间/办公网可能限制外网访问）。\n"
+            f"为保证演示正常，以下为你展示**预收录的本地通用政策库**（见下方通用建议），"
+            f"具体以当地官方文件为准。")
+
+
+def format_unavailable(query: str) -> str:
+    """合规问答场景的联网不可用提示。"""
+    return (f"\n⚠️ 当前网络环境无法实时联网搜索（网络受限或搜索源不可达）。"
+            f"以上回答基于本地知识库，具体以官方最新文件为准。")
 
 
 def search_and_format(region: str) -> str:
@@ -118,13 +169,14 @@ def search_and_format(region: str) -> str:
     results = search_policies(region)
     if not results:
         return ""
-    lines = [f"\n🔍 **实时搜索「{region}」相关政策**（来源：网页搜索结果，需点开核验）："]
+    lines = [f"\n🔍 **实时搜索「{region}」相关政策**（来源：网页搜索结果，官方优先，需点开核验）："]
     for r in results[:6]:
-        line = f"- **{r['title']}**\n  · [查看来源]({r['url']})"
+        tag = {"官方": "🏛 官方", "信息平台": "📄 信息平台", "需核验": "🔗 第三方"}.get(r.get("official"), "")
+        line = f"- {tag} **{r['title']}**\n  · [查看来源]({r['url']})"
         if r.get("snippet"):
             line += f"\n  · {r['snippet']}"
         lines.append(line)
-    lines.append("\n> 以上为搜索引擎实时结果，具体申请条件/金额以官方最新文件为准。")
+    lines.append("\n> 以上为搜索引擎实时结果，🏛官方来源可作申请依据；📄/🔗 为信息平台或第三方，具体申请条件/金额以官方最新文件为准。")
     return "\n".join(lines)
 
 
@@ -133,12 +185,13 @@ def format_web_search(query: str, limit: int = 5) -> str:
     results = search_web(query)
     if not results:
         return ""
-    lines = [f"🔍 实时联网搜索到的相关结果（来源：网页搜索，需点开核验）："]
+    lines = [f"🔍 实时联网搜索到的相关结果（来源：网页搜索，官方优先，需点开核验）："]
     for r in results[:limit]:
-        line = f"- **{r['title']}**"
+        tag = {"官方": "🏛 官方", "信息平台": "📄 信息平台", "需核验": "🔗 第三方"}.get(r.get("official"), "")
+        line = f"- {tag} **{r['title']}**"
         if r.get("snippet"):
             line += f"：{r['snippet']}"
         line += f"\n  · [查看来源]({r['url']})"
         lines.append(line)
-    lines.append("> 以上为搜索引擎实时结果，以官方最新发布为准。")
+    lines.append("> 以上为搜索引擎实时结果，🏛官方来源可作依据，其余以官方最新发布为准。")
     return "\n".join(lines)
