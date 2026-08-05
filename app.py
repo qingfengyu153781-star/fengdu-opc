@@ -1,0 +1,1212 @@
+# -*- coding: utf-8 -*-
+"""枫独 · OPC 经营助手 —— GOAI 无界应用大赛 AI+金融 赛道 Demo
+
+入口：python app.py
+架构：规则引擎（材料预审/经营诊断/风险评估，确定性）+ LLM（合规问答/政策导入，可选）
+零白屏保证：核心闭环纯规则引擎，LLM 无 key 时自动降级 mock → Demo 永不白屏。
+
+运行前设置（可选，合规问答/政策导入才有真实 LLM）：
+    set MODELSCOPE_API_KEY=ms-xxx      (Windows)
+    export MODELSCOPE_API_KEY=ms-xxx   (Linux)
+"""
+import sys
+import re
+
+try:
+    sys.stdout.reconfigure(encoding="utf-8")  # Windows 中文编码
+except Exception:
+    pass
+
+import gradio as gr
+
+from policies import available_regions, region_info, REGION_LABELS, general
+from utils import business_profile as bp
+from utils.rule_engine import summary, match_policies
+from utils.state_model import compute_indices, build_recommendations
+from utils import api_client
+from utils import policy_searcher
+from prompts import agent_prompts
+
+# ---------------------------------------------------------------- 素材加载（base64 内嵌，跨环境无路径问题）
+def _asset_b64(filename: str) -> str:
+    """读取 assets/<filename> 转 base64 data URI，找不到返回空串。"""
+    import base64
+    import os
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", filename)
+    if not os.path.exists(path):
+        return ""
+    with open(path, "rb") as f:
+        b64 = base64.b64encode(f.read()).decode("ascii")
+    ext = filename.rsplit(".", 1)[-1].lower()
+    mime = {"png": "image/png", "jpg": "image/jpeg", "jpeg": "image/jpeg", "webp": "image/webp"}.get(ext, "image/png")
+    return f"data:{mime};base64,{b64}"
+
+
+LOGO_B64 = _asset_b64("logo.png")
+BANNER_B64 = _asset_b64("banner.png")
+BG_B64 = _asset_b64("bg.png")
+# 地区横幅用压缩版（2KB，可安全放进 CSS background）
+REGION_BANNER_B64 = _asset_b64("region_banner_small.webp") or _asset_b64("region_banner.png")
+
+
+# ---------------------------------------------------------------- 枫叶色板（浅暖橙红系）
+MAPLE_RED = "#C84B31"       # 枫红（顶栏/强调）
+MAPLE_GOLD = "#E0A03C"      # 枫金（数据强调）
+BG = "#F1AE86"              # 页面背景：浅枫橙红（浅亮暖色，枫叶感）
+BG_DEEP = "#F4BC99"          # 组件底：偏白橙红（Tab 内容/卡片底）
+PANEL = "#FCE7D2"            # 组件面板：偏白橙红（下拉/输入/对话框底）
+PANEL_LIGHT = "#F6CBA6"      # 组件面板亮阶（hover/选中）
+TEXT = "#4A2C1A"            # 主文字：深棕
+TEXT_SUB = "#8A5A3A"         # 次文字：暖棕
+TEXT_DARK = "#FFF6EF"       # 深色底上的亮字（驾驶舱内）
+COCKPIT = "#A64E30"          # 驾驶舱：橙红容器（局部深色，非大范围）
+COCKPIT_DEEP = "#8A3D24"     # 橙红加深（进度条轨道/卡片底）
+COCKPIT_BORDER = "#E08A5E"   # 橙红亮边
+BUBBLE_USER = "#F6CBA6"      # 用户气泡：浅杏橙
+BUBBLE_AI = "#FCE7D2"        # AI 气泡：偏白橙红
+
+# ---------------------------------------------------------------- CSS（浅暖橙红系）
+# 全页背景改为纯色（bg 图由 HTML img 层负责，避免 CSS base64 膨胀）
+CSS = f"""
+:root {{
+  --maple-red: {MAPLE_RED};
+  --maple-gold: {MAPLE_GOLD};
+  --bg: {BG};
+  --text: {TEXT};
+  --cockpit: {COCKPIT};
+}}
+/* html 背景=兜底色（画在根画布，负z图片之上）；body 必须透明，
+   否则 body 背景作为 in-flow 内容在第3层绘制，会盖住 z-index:-1 的全页背景图 */
+html {{
+  background: {BG} !important;
+}}
+body {{
+  background: transparent !important;
+  color: {TEXT};
+  font-family: "Microsoft YaHei", sans-serif;
+}}
+/* gradio-app 自带不透明白底会盖住全页背景图 → 一并透明 */
+gradio-app, .gradio-app {{
+  background: transparent !important;
+}}
+.gradio-container {{
+  /* 透明：让 #full-bg 全页背景图透出来（横幅修复后误盖为纯色导致背景图消失） */
+  background: transparent !important;
+  max-width: 100% !important;
+}}
+/* 全页背景 img 层：fixed 铺满，透明容器下可见；html/body 纯色兜底 */
+#full-bg {{
+  position: fixed; top: 0; left: 0; width: 100%; height: 100%;
+  z-index: -1; object-fit: cover; pointer-events: none;
+  display: block;
+}}
+#brand-bar {{
+  position: relative; overflow: hidden;
+  color: #fff; padding: 0; border-radius: 0 0 16px 16px;
+  margin-bottom: 12px;
+  box-shadow: 0 3px 14px rgba(200, 75, 49, 0.25);
+}}
+#brand-bar.brand-bar-gradient {{
+  background: linear-gradient(135deg, {MAPLE_RED} 0%, #A83A22 100%);
+  padding: 18px 28px; display: flex; align-items: center; gap: 14px;
+}}
+.brand-banner-img {{
+  position: absolute; top: 0; left: 0; width: 100%; height: 100%;
+  object-fit: cover; z-index: 0; pointer-events: none;
+}}
+.brand-content {{
+  position: relative; z-index: 1;
+  display: flex; align-items: center; gap: 14px;
+  padding: 18px 28px; min-height: 72px;
+  /* 半透明暖枫红渐变遮罩：左侧文字区有对比度，右侧横幅自然露出 */
+  background: linear-gradient(90deg, rgba(200, 75, 49, 0.72) 0%,
+              rgba(200, 75, 49, 0.4) 55%, rgba(200, 75, 49, 0) 100%);
+}}
+.brand-logo {{
+  width: 46px; height: 46px; border-radius: 10px; background: rgba(255,255,255,0.15);
+  display: flex; align-items: center; justify-content: center; font-size: 26px;
+  border: 1.5px solid rgba(255,255,255,0.35); flex-shrink: 0;
+}}
+.brand-logo-img {{
+  width: 52px; height: 52px; object-fit: contain; border-radius: 10px;
+  background: rgba(255, 246, 239, 0.45); padding: 4px;
+  box-shadow: 0 2px 10px rgba(200, 75, 49, 0.4);
+  flex-shrink: 0;
+}}
+.brand-title {{ font-size: 24px; font-weight: 700; letter-spacing: 1px; }}
+.brand-sub {{ font-size: 12.5px; opacity: 0.85; margin-top: 2px; }}
+.region-pill {{
+  margin-left: auto; background: rgba(255,255,255,0.18); padding: 6px 14px;
+  border-radius: 20px; font-size: 13px; border: 1px solid rgba(255,255,255,0.3);
+}}
+.status-ok {{ color: #9FD99F; font-weight: 600; }}
+.status-demo {{ color: {MAPLE_GOLD}; font-weight: 600; }}
+
+/* 驾驶舱（赤陶深容器） */
+.cockpit {{
+  background: {COCKPIT}; color: {TEXT_DARK}; border-radius: 14px; padding: 16px 18px;
+  box-shadow: 0 6px 20px rgba(0,0,0,0.25);
+}}
+.cockpit-head {{ font-size: 15px; font-weight: 700; color: {MAPLE_GOLD};
+  border-bottom: 1px solid rgba(255,255,255,0.16); padding-bottom: 8px; margin-bottom: 10px; }}
+.metric-label {{ font-size: 12px; color: #E3C9B0; margin: 10px 0 4px; }}
+.bar {{ background: {COCKPIT_DEEP}; height: 16px; border-radius: 8px; overflow: hidden; }}
+.bar-fill {{ height: 16px; border-radius: 8px;
+  background: linear-gradient(90deg, {MAPLE_RED}, {MAPLE_GOLD});
+  color: #fff; font-size: 11px; line-height: 16px; text-align: center; font-weight: 600; }}
+.bar-fill.gold {{ background: linear-gradient(90deg, {MAPLE_GOLD}, #F2C25E); }}
+.cockpit-row {{ display: flex; gap: 10px; margin: 12px 0; }}
+.metric {{ flex: 1; background: rgba(255,255,255,0.08); border-radius: 10px;
+  padding: 10px 8px; text-align: center; }}
+.metric .lab {{ font-size: 11px; color: #E3C9B0; }}
+.metric .big {{ font-size: 22px; font-weight: 800; margin-top: 4px; }}
+.gold {{ color: {MAPLE_GOLD}; }}
+.risk-low {{ color: #7FD08A; }} .risk-mid {{ color: {MAPLE_GOLD}; }} .risk-high {{ color: #FF7A70; }}
+.section-title {{ font-size: 12px; color: #E3C9B0; margin: 12px 0 6px; font-weight: 600; }}
+.material {{ font-size: 12.5px; padding: 4px 0; line-height: 1.5; }}
+.material .ok {{ color: #9BD29B; }}
+.material .warn {{ color: {MAPLE_GOLD}; }}
+.cockpit-footer {{ margin-top: 14px; padding-top: 10px; border-top: 1px solid rgba(255,255,255,0.16);
+  font-size: 11.5px; color: #E3C9B0; }}
+.progress {{ font-size: 12.5px; color: #E3C9B0; margin: 8px 0; }}
+
+/* 卡片 & 按钮（深暖） */
+.card {{ background: {BG_DEEP}; border: 1px solid {COCKPIT_BORDER}; border-radius: 14px; padding: 14px 16px;
+  box-shadow: 0 2px 10px rgba(0,0,0,0.2); }}
+.footnote {{ font-size: 11.5px; color: {TEXT_SUB}; margin-top: 8px; line-height: 1.6; }}
+#maple-btn {{
+  background: {MAPLE_RED} !important; border: none !important; color: #fff !important;
+  border-radius: 10px !important; font-weight: 600;
+}}
+#maple-btn:hover {{ background: #A83A22 !important; }}
+#reset-btn {{ background: {COCKPIT_DEEP} !important; color: {TEXT_DARK} !important; border: 1px solid {COCKPIT_BORDER} !important; }}
+#prefill-btn {{ background: {MAPLE_GOLD} !important; color: #3A2015 !important; border: none !important; font-weight: 600; }}
+
+/* 对话区：暖橙底（比 BG_DEEP 深一档、明亮） */
+.wrapper:has(.bubble-wrap) {{
+  background: #EEB085 !important;
+  border-radius: 14px !important;
+  border: 1px solid {COCKPIT_BORDER} !important;
+}}
+/* 消息滚动容器：深色模式下 Gradio 会给它近黑底 rgb(28,25,23)+白字
+   → 强制暖色底 + 深棕文字（深浅色模式通用，避免"对话框还是黑的"） */
+.bubble-wrap {{
+  background: #EEB085 !important;
+  color: {TEXT} !important;
+}}
+.bubble-wrap * {{
+  color: {TEXT} !important;
+}}
+/* 气泡（Gradio 6 真实类名：.message-row.bubble.bot-row .bot.message / user 同构） */
+.message-row.bubble.bot-row .bot.message {{
+  background: {BUBBLE_AI} !important; color: {TEXT} !important;
+  border-radius: 12px !important;
+  border: 1px solid rgba(200, 75, 49, 0.18) !important;
+  box-shadow: none !important;
+}}
+.message-row.bubble.user-row .user.message {{
+  background: {BUBBLE_USER} !important; color: {TEXT} !important;
+  border-radius: 12px !important;
+  border: 1px solid rgba(200, 75, 49, 0.25) !important;
+}}
+/* 对话标题 & 顶部按钮图标：暖深棕，避免暗色观感 */
+.wrapper:has(.bubble-wrap) label {{
+  color: {TEXT} !important;
+}}
+/* Chatbot 顶栏图标按钮（分享/清空/复制）：深色模式下 --block-background-fill 是近黑 rgb(41,37,36)
+   → 强制暖色底 + 深棕图标，深浅色通用 */
+.wrapper:has(.bubble-wrap) .icon-button-wrapper {{
+  background: #E8A878 !important;
+}}
+.wrapper:has(.bubble-wrap) .icon-button {{
+  background: #E8A878 !important;
+  --bg-color: #E8A878 !important;
+}}
+.wrapper:has(.bubble-wrap) .icon-button svg {{
+  color: {TEXT} !important;
+}}
+/* 旧选择器兜底（部分 Gradio 版本仍用 .gr-chatbot） */
+.gr-chatbot .message.user {{
+  background: {BUBBLE_USER} !important; color: {TEXT} !important;
+  border-radius: 12px !important;
+}}
+.gr-chatbot .message.bot {{
+  background: {BUBBLE_AI} !important; color: {TEXT} !important;
+  border-radius: 12px !important;
+}}
+
+/* ---- 统一组件深暖背景（覆盖 gradio 默认白底） ---- */
+.gradio-container label, .gradio-container .block, .gradio-container .form {{
+  background: transparent !important;
+}}
+.gradio-container select {{
+  background: {PANEL} !important;
+  color: {TEXT_DARK} !important;
+  border: 1px solid {COCKPIT_BORDER} !important;
+  border-radius: 10px !important;
+  padding: 8px 12px !important;
+}}
+.gradio-container option {{ background: {PANEL} !important; color: {TEXT_DARK} !important; }}
+.gradio-container textarea, .gradio-container input[type="text"] {{
+  background: {PANEL} !important;
+  color: {TEXT} !important;                /* 深棕文字：亮字(TEXT_DARK)在暖底上看不清 */
+  caret-color: {TEXT} !important;
+  border: 1px solid {COCKPIT_BORDER} !important;
+  border-radius: 10px !important;
+}}
+.gradio-container textarea::placeholder, .gradio-container input[type="text"]::placeholder {{
+  color: rgba(74, 44, 26, 0.55) !important;   /* 半透明深棕 placeholder */
+}}
+.gradio-container textarea:focus, .gradio-container input[type="text"]:focus {{
+  border-color: {MAPLE_GOLD} !important;
+  box-shadow: 0 0 0 2px rgba(224, 160, 60, 0.2) !important;
+}}
+.gradio-container label span {{
+  color: {TEXT} !important;
+}}
+.gradio-container .prose, .gradio-container .markdown,
+.gradio-container .prose :is(p, h1, h2, h3, h4, ul, ol, li, strong, em, span, blockquote, code) {{
+  background: transparent !important;
+  color: {TEXT} !important;
+}}
+/* Markdown 里的链接：深棕描边可点，但颜色保持可读（深色模式 Gradio 会置白） */
+.gradio-container .prose a {{
+  color: {MAPLE_RED} !important;
+  font-weight: 600 !important;
+  text-decoration: underline !important;
+}}
+.gradio-container .prose blockquote {{
+  background: {BG_DEEP} !important;
+  color: {TEXT} !important;
+  border-left: 4px solid {MAPLE_RED} !important;
+  border-radius: 8px;
+  padding: 10px 14px !important;
+}}
+
+/* ---- 地区选择器横幅背景 ---- */
+/* 地区选择器：压缩横幅背景 + 无边框 + 清晰文字 */
+/* gradio .block 边框由 CSS 变量控制 → 用变量归零最有效 */
+.region-dd {{
+  --block-border-width: 0 !important;
+  --block-border-color: transparent !important;
+  --block-shadow: none !important;
+  background-image: url('{REGION_BANNER_B64}') !important;
+  background-size: cover !important;
+  background-position: center !important;
+  border-radius: 12px !important;
+  padding: 8px 12px !important;
+  margin-bottom: 8px !important;
+  border: 0 none !important;
+  border-width: 0 !important;
+  border-style: none !important;
+  border-color: transparent !important;
+  outline: none !important;
+  box-shadow: none !important;
+}}
+/* info 文字：原 Gradio 灰(#a8a29e)看不清 → 加粗深棕 + 浅色描影 */
+.region-dd .info-text {{
+  color: {TEXT} !important;
+  font-weight: 700 !important;
+  font-size: 12.5px !important;
+  text-shadow: 0 0 3px rgba(252, 231, 210, 0.95), 0 0 8px rgba(252, 231, 210, 0.8);
+}}
+/* container=False 把 label 变成 sr-only 视觉隐藏 → 恢复显示为标题 */
+.region-dd span[data-testid="block-info"] {{
+  position: static !important;
+  width: auto !important;
+  height: auto !important;
+  clip: auto !important;
+  clip-path: none !important;
+  margin: 0 0 4px !important;
+  padding: 0 !important;
+  overflow: visible !important;
+  display: block !important;
+  color: {TEXT} !important;
+  font-weight: 700 !important;
+  font-size: 14px !important;
+}}
+/* 下拉字段：Gradio 灰白 #F5F5F4 → 暖面板色（Gradio 6 是 input+div.wrap，非原生 select） */
+.region-dd .wrap, .region-dd .wrap-inner, .region-dd .secondary-wrap {{
+  background: rgba(252, 231, 210, 0.92) !important;
+  border: none !important;
+}}
+.region-dd input[role="listbox"] {{
+  background: transparent !important;
+  color: {TEXT} !important;
+  font-weight: 600 !important;
+  border: none !important;
+}}
+/* 选项弹层：白底 → 暖面板 */
+.region-dd .options {{
+  background: {PANEL} !important;
+  border: 1px solid {COCKPIT_BORDER} !important;
+  border-radius: 10px !important;
+  box-shadow: 0 6px 20px rgba(0,0,0,0.15) !important;
+}}
+.region-dd .options .item {{
+  color: {TEXT} !important;
+}}
+.region-dd .options .item.selected,
+.region-dd .options .item.active,
+.region-dd .options .item:hover {{
+  background: {PANEL_LIGHT} !important;
+  color: {TEXT} !important;
+}}
+
+/* ---- Tab 标签（深暖）---- Gradio 6 真实结构是 [role="tab"]，非旧 .tab-nav */
+.gradio-container [role="tab"] {{
+  background: transparent !important;
+  color: {TEXT} !important;               /* 深棕，深色模式下默认白字看不清 */
+  font-weight: 600 !important;
+  border-radius: 10px 10px 0 0 !important;
+  border: none !important;
+}}
+.gradio-container [role="tab"]:hover {{
+  background: {PANEL} !important; color: {TEXT} !important;
+}}
+.gradio-container [role="tab"].selected {{
+  background: {PANEL} !important;
+  color: {MAPLE_RED} !important;
+  font-weight: 700 !important;
+  border-bottom: 3px solid {MAPLE_GOLD} !important;
+}}
+/* Tab 内容容器 */
+.gradio-container .tabitem {{
+  background: {BG_DEEP} !important;
+  border-radius: 0 14px 14px 14px !important;
+  padding: 16px !important;
+  border: 1px solid {COCKPIT_BORDER} !important;
+}}
+
+/* 卡片 & 按钮区背景（深暖） */
+.card {{ background: {BG_DEEP} !important; border: 1px solid {COCKPIT_BORDER} !important; border-radius: 14px; padding: 14px 16px;
+  box-shadow: 0 2px 10px rgba(0,0,0,0.2); }}
+
+/* 隐藏 Gradio 底部导航（通过 API 使用 / 使用 Gradio 构建 / 设置） */
+.gradio-container footer, .gradio-container > footer,
+footer[aria-label="Gradio footer navigation"] {{
+  display: none !important;
+}}
+"""
+
+
+# ---------------------------------------------------------------- 驾驶舱渲染
+def _status_class(level: str) -> str:
+    return {"低": "risk-low", "中": "risk-mid", "高": "risk-high"}.get(level, "risk-mid")
+
+
+def render_cockpit(profile: dict, region: str, indices: dict | None = None,
+                   summ: dict | None = None, partial: bool = False) -> str:
+    """渲染驾驶舱 HTML。partial=True 表示材料预审采集过程中。"""
+    info = region_info(region)
+    region_label = info.get("name", region)
+    status_txt = info.get("data_status", "")
+    status_cls = "status-ok" if "真实" in status_txt else "status-demo"
+
+    head = (f"📊 经营驾驶舱 · {region_label}"
+            f" <span class='{status_cls}' style='font-size:11px'>（{status_txt}）</span>")
+
+    if partial or indices is None:
+        filled = sum(1 for k, v in profile.items() if v)
+        total = len(bp.FIELD_KEYS)
+        pct = round(filled / total * 100)
+        return f"""
+        <div class="cockpit">
+          <div class="cockpit-head">{head}</div>
+          <div class="metric-label">经营信息采集进度</div>
+          <div class="bar"><div class="bar-fill" style="width:{pct}%">{pct}%</div></div>
+          <div class="progress">已收集 {filled}/{total} 项 · 继续回答 AI 的问题即可</div>
+          <div class="metric-label">已识别字段</div>
+          <div class="material">{bp.summarize(profile) or '—'}</div>
+          <div class="cockpit-footer">🛡️ 辅助参考 · 不替代专业机构 · 来源可溯源</div>
+        </div>"""
+
+    risk = indices["risk"]
+    checklist = summ["checklist"] if summ else []
+    missing = [m for m in checklist if m["status"] == "缺失"]
+    pending = [m for m in checklist if m["status"] == "待确认"]
+    auto = [m for m in checklist if m["status"] == "自动"]
+    todo = len(missing)
+    health = indices["health"]
+
+    mat_html = ""
+    for m in (missing + pending)[:6]:
+        if m["status"] == "缺失":
+            mat_html += f'<div class="material"><span class="warn">⚠️ {m["name"]}</span></div>'
+        else:
+            mat_html += f'<div class="material"><span class="warn">⏳ {m["name"]}</span></div>'
+    shown = len((missing + pending)[:6])
+    total = len(checklist)
+    if auto:
+        mat_html += f'<div class="material"><span class="ok">✅ 自动享受 {len(auto)} 项（系统直享，无需材料）</span></div>'
+    if shown + len(auto) < total:
+        mat_html += f'<div class="progress">还有 {total - shown - len(auto)} 项 · 共 {total} 项</div>'
+    if not missing and not pending and not auto:
+        mat_html = '<div class="material"><span class="ok">✅ 材料齐全</span></div>'
+
+    rate = summ["match_rate"] if summ else 0
+    recs = build_recommendations(profile, indices)
+    rec_html = "".join(f"<li>{r}</li>" for r in recs[:3])
+
+    return f"""
+    <div class="cockpit">
+      <div class="cockpit-head">{head}</div>
+      <div class="metric-label">经营健康度</div>
+      <div class="bar"><div class="bar-fill" style="width:{health}%">{health}%</div></div>
+      <div class="cockpit-row">
+        <div class="metric"><div class="lab">政策机会</div><div class="big gold">{indices['policy_opportunity']}</div></div>
+        <div class="metric"><div class="lab">风险等级</div><div class="big {_status_class(risk['level'])}">{risk['level']}</div></div>
+        <div class="metric"><div class="lab">待办</div><div class="big">{todo}</div></div>
+      </div>
+      <div class="section-title">缺失材料</div>
+      {mat_html}
+      <div class="metric-label">政策匹配度 {rate}%</div>
+      <div class="bar"><div class="bar-fill gold" style="width:{rate}%"></div></div>
+      <div class="section-title">行动建议</div>
+      <ol style="margin:4px 0 0;padding-left:18px;font-size:12.5px;line-height:1.7;">{rec_html}</ol>
+      <div class="cockpit-footer">🛡️ 辅助参考 · 不替代专业机构 · 来源可溯源</div>
+    </div>"""
+
+
+# ---------------------------------------------------------------- 文本渲染
+def render_report(profile: dict, summ: dict, indices: dict, title: str = "预审结果", real_search: bool = False) -> str:
+    """诊断完成后的报告文本（对话流里展示）。
+
+    real_search=True 表示已有实时搜索结果（单独区块展示），不再重复渲染通用方向库。
+    """
+    lines = []
+    lines.append(f"📋 **{title}**")
+    matched = summ["matched_policies"]
+    # 区分：国家级自动享受（无需操作） vs 地区差异化可申请（需要你去做）
+    local_matched = [p for p in matched if p.get("region") != "national"]
+    national_matched = [p for p in matched if p.get("region") == "national"]
+    if local_matched:
+        lines.append(f"✅ 你符合 **{len(local_matched)} 项地区政策**可申请：")
+        for p in local_matched[:4]:
+            lines.append(f"- **{p['name']}**（{p['amount']}）\n  · 条件：{'；'.join(p['eligibility'][:2])}\n  · 来源：{p['source']} [查看]({p['source_url']})")
+        if len(local_matched) > 4:
+            lines.append(f"  …还有 {len(local_matched)-4} 项")
+    elif summ.get("region_status", "").startswith("通用参考") and not real_search:
+        # 未收录地区且实时搜索失败 → 展示通用政策方向（零造假：标注需核验，不算可申请）
+        lines.append("📌 实时搜索暂不可用，为你列出**常见政策方向**（具体以当地官方为准）：")
+        for p in general.POLICIES[:6]:
+            lines.append(f"- **{p['name']}**（{p['amount']}）")
+        lines.append("\n> 这些是通用参考，**不代表当地一定有/金额一致**。用 ④政策导入 粘贴当地真实政策原文，可自动入库匹配。")
+    else:
+        lines.append("当前无直接可申请的地区政策（部分资格待确认，可继续补充信息）。")
+    if national_matched:
+        lines.append(f"\n🎯 **另 {len(national_matched)} 项全国通用政策自动享受**（无需申请）：")
+        lines.append("  " + "、".join(p["name"] for p in national_matched))
+
+    missing = [m for m in summ["checklist"] if m["status"] == "缺失"]
+    if missing:
+        lines.append(f"\n⚠️ **建议优先准备材料**（缺 {len(missing)} 项）：")
+        for m in missing[:5]:
+            lines.append(f"- {m['name']}" + (f"（{m['format_note']}）" if m.get("format_note") else ""))
+        if len(missing) > 5:
+            lines.append(f"  …共 {len(missing)} 项")
+    else:
+        lines.append("\n✅ 材料清单完整。")
+
+    risk = indices["risk"]
+    if risk["risks"]:
+        lines.append(f"\n🔍 **风险提示（等级：{risk['level']}）**")
+        for r in risk["risks"][:3]:
+            lines.append(f"- {r['desc']} → {r['advice']}")
+
+    lines.append("\n🛡️ 以上为辅助参考，不替代专业机构/金融机构最终判断，政策以官方最新文件为准。")
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------- 材料预审状态机
+_REGION_CODE_BY_LABEL = {v: k for k, v in REGION_LABELS.items()}
+
+
+def _region_code(name_or_code: str) -> str:
+    """把地区名/下拉值转成下拉可用值（label→code；未收录地区保留原名自定义）。"""
+    if name_or_code in REGION_LABELS:
+        return name_or_code
+    return _REGION_CODE_BY_LABEL.get(name_or_code, name_or_code)
+
+
+def _looks_like_off_topic(text: str) -> bool:
+    """判断回答是否明显跑题（跳过/不知道），此时不应把原文硬塞进字段。"""
+    return any(k in text for k in ("不知道", "不清楚", "跳过", "下一个", "随便", "换一个"))
+
+
+def process_chat(user_text: str, profile: dict, chat: list, region: str):
+    """材料预审：用户输入 → 抽取字段 → 追问 or 出报告。
+
+    地区以「用户消息里明确说的城市」优先，否则用下拉值；并同步下拉。
+    追问时若用户回答当前字段但关键词没抽到 → yes/no 枚举兜底，保证进度前进。
+    """
+    chat = chat or []
+    user_text = (user_text or "").strip()
+    if not user_text:
+        return "", profile, region, chat, render_cockpit(profile, region, partial=True), ""
+    chat.append({"role": "user", "content": user_text})
+
+    # 规则抽取字段（确定性）
+    extracted = bp.extract_from_text(user_text, profile)
+
+    # 兜底抽取：用户回答当前被问字段，但关键词没抽到 → 尽力识别，保证进度前进
+    missing = bp.missing_fields(profile)
+    if missing and missing[0]["key"] not in extracted and not profile.get(missing[0]["key"]):
+        q_key = missing[0]["key"]
+        if q_key in ("social_security", "corp_account", "biz_scope_ai"):
+            v = bp.parse_yes_no(user_text)
+            if v:
+                extracted[q_key] = v
+        elif q_key in ("revenue", "duration", "cash_buffer", "order_cycle", "team_size", "grad_year"):
+            v = bp.extract_loose_number(user_text, q_key)
+            if v:
+                extracted[q_key] = v
+        else:
+            # 自由文本字段（region/reg_type/education/industry…）：
+            # 仅当回答简短、非跑题、且没提供其他字段信息时，直接记录原文，保证不卡死。
+            other_fields = [k for k in extracted if k != q_key]
+            if len(user_text) <= 40 and not _looks_like_off_topic(user_text) and not other_fields:
+                extracted[q_key] = user_text
+
+    new_keys = [k for k, v in extracted.items() if v and not profile.get(k)]
+    profile.update(extracted)
+    if new_keys:
+        chat.append({"role": "assistant",
+                     "content": f"✅ 已记录：{'、'.join(bp_summarize_key(k, v) for k, v in extracted.items() if k in new_keys)}"})
+
+    # 地区：用户消息里明确说的城市 > 下拉当前值 > 已有地区
+    if extracted.get("region"):
+        profile["region"] = extracted["region"]
+    else:
+        # 下拉值优先（用户可能改了地区下拉/输入了自定义地区）
+        dd_region = REGION_LABELS.get(region, region) if region else ""
+        if dd_region:
+            profile["region"] = dd_region
+        else:
+            profile.setdefault("region", REGION_LABELS.get(region, region))
+    region_out = _region_code(profile["region"])
+    region_val = profile["region"]
+
+    if not bp.is_complete(profile):
+        q = bp.next_question(profile)
+        # LLM 可用时润色问题，否则用规则问题（问题自带选项提示）
+        question = polish_question(q, profile) if api_client.is_api_available() else q
+        chat.append({"role": "assistant", "content": f"🤔 {question}"})
+        cockpit = render_cockpit(profile, region_out, partial=True)
+        status = f"⏳ 已收集 {sum(1 for v in profile.values() if v)}/{len(bp.FIELD_KEYS)} 项 · 回答上方的 AI 问题继续"
+        return "", profile, region_out, chat, cockpit, status
+
+    # 完整 → 匹配 + 诊断（一律用 region code 匹配政策库，profile['region'] 仅中文展示用）
+    summ = summary(profile, region_out)
+    indices = compute_indices(profile, region_out)
+    is_unknown = summ.get("region_status", "").startswith("通用参考")
+
+    # 未收录地区 → 实时搜索当地政策（优先）；失败回退通用方向
+    search_block = ""
+    if is_unknown:
+        search_block = policy_searcher.search_and_format(region_val)
+        # LLM 增强：有 key 时基于搜索结果整理更精准的方向（可叠加）
+        if api_client.is_api_available():
+            llm_pol = lookup_local_policies(region_val, profile)
+            if llm_pol:
+                search_block += "\n" + llm_pol
+
+    report = render_report(profile, summ, indices, real_search=bool(search_block))
+    if search_block:
+        report += search_block
+    chat.append({"role": "assistant", "content": report})
+    cockpit = render_cockpit(profile, region_out, indices, summ, partial=False)
+    status = "✅ 预审完成 · 可切换地区或修改信息重新诊断"
+    return "", profile, region_out, chat, cockpit, status
+
+
+def bp_summarize_key(k: str, v: str) -> str:
+    label = next((f["label"] for f in bp.FIELDS if f["key"] == k), k)
+    return f"{label}={v}"
+
+
+def polish_question(question: str, profile: dict) -> str:
+    """用 LLM 把规则问题说成人话；失败回退规则问题。"""
+    try:
+        profile_sum = bp.to_llm_context(profile)
+        sys_p = agent_prompts.Q_A_PROMPT.format(
+            profile_summary=profile_sum, field_label="", question=question)
+        content, _ = api_client.chat(
+            [{"role": "system", "content": sys_p},
+             {"role": "user", "content": f"请把这个问题说得更口语化：{question}"}],
+            max_tokens=120)
+        content = content.strip().split("\n")[0].strip()
+        if 4 < len(content) < 60:
+            return content
+    except Exception:
+        pass
+    return question
+
+
+# ---------------------------------------------------------------- 经营诊断
+def run_diagnosis(profile_inputs: dict, region: str):
+    """经营诊断：填表 → 三指数 + 驾驶舱 + 报告。"""
+    profile = bp.empty_profile()
+    profile.update({k: (v or "").strip() for k, v in profile_inputs.items() if v})
+    if region:
+        # code（wenzhou/guangzhou…）→ 中文展示名；自定义中文（福建/广州…）直接用
+        profile["region"] = REGION_LABELS.get(region, region)
+
+    missing = bp.missing_fields(profile)
+    if missing:
+        first = ", ".join(f["label"] for f in missing[:3])
+        return (render_cockpit(profile, region, partial=True),
+                f"⚠️ 还缺：{first}（共 {len(missing)} 项），请补充后重试")
+    summ = summary(profile, region)
+    indices = compute_indices(profile, region)
+    cockpit = render_cockpit(profile, region, indices, summ, partial=False)
+
+    # 未收录地区 → 实时搜索当地政策（与 Tab1 一致）
+    search_block = ""
+    if summ.get("region_status", "").startswith("通用参考"):
+        # code（wenzhou/guangzhou…）→ 中文名；自定义输入（福建/广州…）直接用中文
+        region_name = REGION_LABELS.get(region) or profile.get("region") or region
+        search_block = policy_searcher.search_and_format(region_name)
+
+    report = render_report(profile, summ, indices, title="诊断结果", real_search=bool(search_block))
+    if search_block:
+        report += search_block
+    return cockpit, report
+
+
+# ---------------------------------------------------------------- 合规问答
+COMPLIANCE_MOCK = {
+    "小微": "小型微利企业年应纳税所得额不超过 300 万元，实际税负约 5%，季度申报时系统自动享受，无需单独备案。辅助参考，以税务部门最新口径为准。",
+    "报税": "一人公司/个体户报税注意：①小规模纳税人月销售额 10 万以下（季度 30 万）免征增值税；②小型微利企业实际税负约 5%；③补贴收入通常不征企业所得税，但以当地税务口径为准；④建议从 Day 1 记清收入/成本/研发支出，避免年底补账。辅助参考，以税务部门最新口径为准。",
+    "增值税": "月销售额 10 万以下（按季 30 万）的小规模纳税人免征增值税，申报时系统自动判断。辅助参考，以官方公告为准。",
+    "社保": "一人公司/个体户可缴灵活就业社保，多项温州创业补贴要求缴纳社保（如创业带动就业补贴、人才租房补贴），建议尽早开通。辅助参考。",
+    "加计": "研发费用可在税前加计扣除，需建立研发费用辅助账。对单人软件公司，大模型 API 费用可计入研发投入。辅助参考，以税务申报要求为准。",
+    "双软": "软件企业两免三减半需通过双软认定（软件产品登记 + 软件企业认定），建议找代理机构办理（¥3,000-8,000 一次性）。辅助参考。",
+}
+
+
+def compliance_chat(message, history):
+    history = history or []
+    history.append({"role": "user", "content": message})
+
+    # 实时联网搜索（免费，独立于 LLM；失败静默）
+    web_block = policy_searcher.format_web_search(message)
+
+    if api_client.is_api_available():
+        try:
+            msgs = [{"role": "system", "content": agent_prompts.COMPLIANCE_PROMPT.format(
+                question=message, knowledge=agent_prompts.COMPLIANCE_KNOWLEDGE)}]
+            msgs += [{"role": h["role"], "content": h["content"]} for h in history[-6:]]
+            answer, _ = api_client.chat(msgs, temperature=0.5, max_tokens=800)
+            answer = answer.strip()
+            if web_block:
+                answer += "\n\n" + web_block
+            history.append({"role": "assistant", "content": answer})
+            return history, ""
+        except Exception:
+            pass
+    # mock 兜底
+    answer = "「枫独」目前以离线知识库作答（未配置 LLM API）：\n\n"
+    hit = next((v for k, v in COMPLIANCE_MOCK.items() if k in message), None)
+    answer += hit or "这个问题涉及专业判断，建议咨询当地税务/法务专业人员。"
+    answer += "\n\n🛡️ 辅助参考，不替代专业机构判断。"
+    if web_block:
+        answer += "\n\n" + web_block
+    history.append({"role": "assistant", "content": answer})
+    return history, ""
+
+
+# ---------------------------------------------------------------- 政策导入
+def import_policy(region: str, policy_text: str):
+    """政策导入：粘贴原文 → LLM 结构化 → 追加到 policies/<region>.py。"""
+    policy_text = (policy_text or "").strip()
+    if not policy_text:
+        return "请先粘贴政策原文。"
+    if api_client.is_api_available():
+        try:
+            sys_p = agent_prompts.POLICY_IMPORT_PROMPT.format(region=region, policy_text=policy_text)
+            raw, model = api_client.generate(sys_p, "", temperature=0.2, max_tokens=2500)
+            parsed = _parse_import_json(raw)
+            if parsed:
+                n = _write_policies_file(region, parsed)
+                return (f"✅ 已入库 **{n} 条**政策（AI 结构化）\n\n"
+                        f"地区「{region}」政策库已更新，可在驾驶舱下拉选择后重新匹配。\n\n"
+                        f"⚠️ 请人工核对入库内容与原文一致——AI 结构化可能出错，以官方文件为准。")
+            # AI 失败 → 回退规则解析
+            parsed = _parse_policy_rules(policy_text)
+            if parsed:
+                n = _write_policies_file(region, parsed)
+                return (f"✅ 已入库 **{n} 条**政策（规则解析）\n\n"
+                        f"地区「{region}」政策库已更新。\n\n"
+                        f"⚠️ 规则解析识别有限，请人工核对入库内容与官方原文一致。")
+            return "⚠️ 无法解析政策结构，请检查原文格式或稍后重试。"
+        except Exception as e:
+            return f"⚠️ 导入失败：{e}，请稍后重试。"
+    # 离线 → 规则解析（零 LLM 依赖也能导入）
+    parsed = _parse_policy_rules(policy_text)
+    if parsed:
+        n = _write_policies_file(region, parsed)
+        return (f"✅ 已入库 **{n} 条**政策（离线规则解析）\n\n"
+                f"地区「{region}」政策库已更新，可在驾驶舱下拉选择后重新匹配。\n\n"
+                f"⚠️ 规则解析识别有限，请人工核对入库内容与官方原文一致。")
+    return "⚠️ 未能识别政策结构，请检查原文格式后重试。"
+
+
+def _parse_import_json(raw: str) -> list[dict]:
+    import json, re
+    text = re.sub(r"```(?:json)?", "", raw).strip()
+    m = re.search(r"\{.*\}", text, re.S)
+    if not m:
+        return []
+    try:
+        data = json.loads(m.group(0))
+    except Exception:
+        return []
+    policies = data.get("policies", []) if isinstance(data, dict) else []
+    out = []
+    for p in policies:
+        if isinstance(p, dict) and p.get("name"):
+            out.append({
+                "name": str(p.get("name", "")).strip(),
+                "region": "",
+                "category": p.get("category", "其他"),
+                "amount": str(p.get("amount", "以官方文件为准")),
+                "eligibility": p.get("eligibility") or [],
+                "materials": p.get("materials") or [],
+                "source": str(p.get("source", "")),
+                "source_url": str(p.get("source_url", "")),
+                "difficulty": p.get("difficulty", "待评估"),
+                "timing": str(p.get("timing", "")),
+                "key_point": str(p.get("key_point", "")),
+                "update_date": "2026-08",
+            })
+    return out
+
+
+def _parse_json_array(raw: str) -> list[dict]:
+    """解析 LLM 输出的 JSON 数组（可能是纯数组或包在 markdown 代码块里）。"""
+    import json, re
+    text = re.sub(r"```(?:json)?", "", raw).strip()
+    # 优先找数组
+    m = re.search(r"\[.*\]", text, re.S)
+    if not m:
+        return []
+    try:
+        data = json.loads(m.group(0))
+    except Exception:
+        return []
+    if not isinstance(data, list):
+        return []
+    return [p for p in data if isinstance(p, dict) and p.get("name")]
+
+
+def lookup_local_policies(region: str, profile: dict) -> str:
+    """LLM 生成当地政策方向（仅未收录地区 + 有 key 时）。失败返回空串。"""
+    try:
+        sys_p = agent_prompts.POLICY_LOOKUP_PROMPT.format(region=region,
+                                                           profile_summary=bp.to_llm_context(profile))
+        raw, model = api_client.generate(sys_p, "", temperature=0.4, max_tokens=2000)
+        items = _parse_json_array(raw)
+        if not items:
+            return ""
+        lines = [f"\n🤖 **AI 按「{region}」检索的政策方向**（{model}，仅供参考，需以当地官方为准）："]
+        for p in items[:6]:
+            lines.append(f"- **{p['name']}**（{p.get('amount', '以当地官方为准')}）\n  · {p.get('key_point', '')[:40]}")
+        lines.append("\n> 以上为 AI 依据公开知识整理的**政策方向**，不代表当地一定有/金额一致，请以官方最新文件为准。")
+        return "\n".join(lines)
+    except Exception:
+        return ""
+
+
+def _parse_policy_rules(text: str) -> list[dict]:
+    """规则引擎版政策解析（零 LLM 依赖）：从政策原文抽取结构化字段。
+
+    离线也能用——抽取名称/金额/资格条件/材料/来源，供 ④政策导入 兜底。
+    识别范围有限，抽不全的字段留默认 + 标注需人工核对。
+    """
+    text = (text or "").strip()
+    if not text:
+        return []
+
+    # 名称：优先取第一行或含"补贴/资助/优惠/减免/支持/奖励"的行
+    name = ""
+    for line in text.splitlines():
+        line = line.strip()
+        if line and any(k in line for k in ("补贴", "资助", "优惠", "减免", "支持", "奖励", "创业")):
+            name = line[:50]
+            break
+    if not name:
+        # 取第一行
+        first = next((l for l in text.splitlines() if l.strip()), "")
+        name = first[:50]
+
+    # 金额
+    amount = ""
+    m = re.search(r"([¥￥]?\s*[\d,]+(?:\.\d+)?\s*(?:万元?|元)|最高[^。；；\n]{0,12}?|每个?年[^。；；\n]{0,12}?)", text)
+    if m:
+        amount = m.group(1).strip()[:30]
+    if not amount:
+        m2 = re.search(r"([\d,]+\.?\d*\s*万元?|[\d,]+\.?\d*\s*元)", text)
+        if m2:
+            amount = m2.group(1).strip()[:30]
+    if not amount:
+        amount = "以官方文件为准"
+
+    # 资格条件：找含"以下""条件""应具备""要求""须"的句子，或含数字/学历/年限的句子
+    eligibility = []
+    seen = set()
+    for line in text.splitlines():
+        line = line.strip().rstrip("。；;")
+        if not line or len(line) > 80:
+            continue
+        if any(k in line for k in ("学历", "毕业", "年", "注册", "缴纳", "参保", "社保", "企业",
+                                   "符合", "条件", "要求", "须", "需", "入驻", "缴纳", "经营")):
+            key = line[:20]
+            if key not in seen:
+                seen.add(key)
+                eligibility.append(line)
+        if len(eligibility) >= 4:
+            break
+    if not eligibility:
+        eligibility = ["以当地官方文件为准"]
+
+    # 申请材料：找含"材料""身份证""营业执照""申请表"的行
+    materials = []
+    for line in text.splitlines():
+        line = line.strip()
+        for kw in ("身份证", "营业执照", "毕业证", "学历", "申请表", "材料", "社保", "证明", "合同", "发票", "照片"):
+            if kw in line:
+                materials.append({"name": line[:40], "required": True})
+                break
+        if len(materials) >= 6:
+            break
+    if not materials:
+        materials = [{"name": "以当地官方要求为准", "required": True}]
+
+    # 来源：找含"官网/平台/部门/局/中心"的行
+    source = "以官方文件为准"
+    for line in text.splitlines():
+        line = line.strip()
+        if any(k in line for k in ("人社局", "人社", "局", "平台", "中心", "官网", "政务", "委", "办")):
+            source = line[:40]
+            break
+
+    return [{
+        "name": name,
+        "region": "",
+        "category": "其他",
+        "amount": amount,
+        "eligibility": eligibility,
+        "materials": materials,
+        "source": source,
+        "source_url": "",
+        "difficulty": "待评估",
+        "timing": "以当地官方为准",
+        "key_point": "规则解析自动入库，请人工核对与官方原文一致",
+        "update_date": "2026-08",
+    }]
+
+
+def _write_policies_file(region: str, policies: list[dict]) -> int:
+    """把结构化政策写入 policies/<region>.py 并注册。"""
+    import os
+
+    code = _slug(region)
+    # policies 包目录 = 本文件所在目录下 policies/
+    pkg_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "policies")
+    path = os.path.join(pkg_dir, f"{code}.py")
+    # 若文件已存在，读回现有政策追加
+    existing = []
+    if os.path.exists(path):
+        try:
+            import importlib
+            mod = importlib.import_module(f"policies.{code}")
+            existing = list(getattr(mod, "POLICIES", []))
+        except Exception:
+            existing = []
+
+    nxt_id = len(existing) + 1
+    for i, p in enumerate(policies):
+        p["id"] = f"IMP-{nxt_id + i}"
+        p["region"] = code
+
+    new_policies = existing + policies
+    # 生成代码
+    from datetime import datetime
+    today = "2026-08"
+    body_lines = [
+        f'# -*- coding: utf-8 -*-',
+        f'"""政策导入生成（{today}）—— 来源：用户粘贴原文 + LLM 结构化，请人工核对。"""',
+        "",
+        'REGION = {',
+        f'    "name": "{region}",',
+        f'    "code": "{code}",',
+        f'    "data_status": "导入数据·待核对",',
+        f'    "update_date": "{today}",',
+        '    "note": "由政策导入功能生成，请核对与官方文件一致",',
+        '}',
+        "",
+        "POLICIES = [",
+    ]
+    for p in new_policies:
+        body_lines.append("    {")
+        for k in ["id", "name", "region", "category", "amount", "source", "source_url",
+                  "difficulty", "timing", "key_point", "update_date"]:
+            body_lines.append(f'        "{k}": {_py_str(p.get(k, ""))},')
+        body_lines.append('        "eligibility": ' + repr(p.get("eligibility", [])) + ",")
+        body_lines.append('        "materials": ' + repr(p.get("materials", [])) + ",")
+        body_lines.append("    },")
+    body_lines.append("]")
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("\n".join(body_lines))
+
+    # 注册到 REGIONS
+    _register_region(code, region)
+    return len(policies)
+
+
+def _py_str(s) -> str:
+    return repr(str(s).replace("'", "\\'"))
+
+
+_CITY_PINYIN = {
+    "温州": "wenzhou", "杭州": "hangzhou", "北京": "beijing", "上海": "shanghai",
+    "广州": "guangzhou", "深圳": "shenzhen", "厦门": "xiamen", "福州": "fuzhou",
+    "南京": "nanjing", "苏州": "suzhou", "成都": "chengdu", "重庆": "chongqing",
+    "武汉": "wuhan", "西安": "xian", "天津": "tianjin", "青岛": "qingdao",
+    "宁波": "ningbo", "长沙": "changsha", "合肥": "hefei", "郑州": "zhengzhou",
+    "济南": "jinan", "昆明": "kunming", "大连": "dalian", "沈阳": "shenyang",
+    "哈尔滨": "haerbin", "长春": "changchun", "太原": "taiyuan", "石家庄": "shijiazhuang",
+    "南昌": "nanchang", "贵阳": "guiyang", "南宁": "nanning", "兰州": "lanzhou",
+    "乌鲁木齐": "wulumuqi", "呼和浩特": "huhehaote", "银川": "yinchuan",
+    "西宁": "xining", "拉萨": "lasa", "海口": "haikou", "三亚": "sanya",
+    "东莞": "dongguan", "佛山": "foshan", "泉州": "quanzhou", "浙江": "zhejiang",
+    "福建": "fujian", "广东": "guangdong", "江苏": "jiangsu", "山东": "shandong",
+    "四川": "sichuan", "湖北": "hubei", "湖南": "hunan", "河南": "henan",
+    "河北": "hebei", "陕西": "shaanxi", "安徽": "anhui", "江西": "jiangxi",
+    "辽宁": "liaoning", "吉林": "jilin", "黑龙江": "heilongjiang",
+    "云南": "yunnan", "贵州": "guizhou", "广西": "guangxi", "山西": "shanxi",
+    "甘肃": "gansu", "新疆": "xinjiang", "内蒙古": "neimenggu", "海南": "hainan",
+    "青海": "qinghai", "宁夏": "ningxia", "西藏": "xizang", "台湾": "taiwan",
+}
+
+
+def _slug(name: str) -> str:
+    """地区名 → 拼音 code（用于文件名/注册 key）。未收录城市用 province_city 兜底。"""
+    name = (name or "").strip()
+    if name in _CITY_PINYIN:
+        return _CITY_PINYIN[name]
+    # 兜底：取第一个汉字拼音首字母不可靠 → 用 pinyin 无依赖 → 用 transliteration 简单表
+    # 这里用「sanitize + 固定后缀」保证安全唯一
+    import re
+    clean = re.sub(r"[^a-zA-Z0-9]", "", name.lower())
+    if clean:
+        return "custom_" + clean
+    return "custom_region"
+
+
+def _register_region(code: str, name: str):
+    """把新地区注册进 policies/__init__.py 的 REGIONS + REGION_LABELS。"""
+    import os
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "policies", "__init__.py")
+    with open(path, "r", encoding="utf-8") as f:
+        src = f.read()
+    # 已注册则跳过（检查 REGIONS 里是否已有该 code）
+    import re as _re
+    if _re.search(rf'"re"{code}"\s*:', src) or f'"{code}":' in src:
+        return
+    # 动态加载模块
+    anchor = '    "hangzhou": hangzhou,\n'
+    if anchor in src:
+        src = src.replace(anchor, anchor + f'    "{code}": __import__("policies.{code}", fromlist=["{code}"]),\n', 1)
+    else:
+        # 没有 hangzhou 锚点（理论不会）→ 插到 REGIONS 开头后
+        src = src.replace('REGIONS = {\n', f'REGIONS = {{\n    "{code}": __import__("policies.{code}", fromlist=["{code}"]),\n', 1)
+    src = src.replace(
+        'REGION_LABELS = {\n    "national": "国家级（全国通用）",\n',
+        f'REGION_LABELS = {{\n    "national": "国家级（全国通用）",\n    "{code}": "{name}",\n', 1)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(src)
+
+
+# ---------------------------------------------------------------- 页面布局
+def build_ui():
+    regions = available_regions()
+    region_choices = [(REGION_LABELS.get(r, r), r) for r in regions]
+
+    # 顶栏：Logo 图优先，横幅背景优先；缺失回退 emoji + 渐变
+    logo_html = (f'<img src="{LOGO_B64}" class="brand-logo-img" alt="枫独"/>'
+                 if LOGO_B64 else '<div class="brand-logo">🍁</div>')
+    banner_img = (f'<img src="{BANNER_B64}" class="brand-banner-img" alt=""/>'
+                  if BANNER_B64 else '')
+    bar_cls = "brand-bar" if BANNER_B64 else "brand-bar brand-bar-gradient"
+
+    with gr.Blocks(title="枫独 · OPC 经营助手") as demo:
+        # 全页背景图（img 层，absolute 铺满）
+        if BG_B64:
+            gr.HTML(f'<img src="{BG_B64}" id="full-bg" alt=""/>')
+        gr.HTML(f"""
+        <div id="brand-bar" class="{bar_cls}">
+          {banner_img}
+          <div class="brand-content">
+            {logo_html}
+            <div>
+              <div class="brand-title">枫独 · OPC 经营助手</div>
+              <div class="brand-sub">让一人公司把公司开明白 —— AI+金融 · 材料预审 / 经营诊断 / 合规问答</div>
+            </div>
+            <div class="region-pill" id="region-pill">地区可切换</div>
+          </div>
+        </div>
+        """)
+
+        region_dd = gr.Dropdown(choices=region_choices, value="wenzhou",
+                                label="📍 经营地区（不同地区政策不同）",
+                                info="切换地区：国家级通用政策始终生效，地区政策跟随切换。可直接输入任意城市/省份（未收录地区仅匹配全国通用政策，可在④导入政策）",
+                                container=False,
+                                elem_classes="region-dd",
+                                allow_custom_value=True)
+
+        with gr.Tabs():
+            # ---------- Tab1 材料预审 ----------
+            with gr.Tab("① 补贴材料预审"):
+                gr.Markdown("> **场景**：一句话描述你的经营情况，AI 会主动追问关键信息，然后匹配可申请政策、生成材料清单、提示资格风险。")
+                with gr.Row():
+                    with gr.Column(scale=7):
+                        chatbot = gr.Chatbot(height=430, label="对话",
+                                             value=[{"role": "assistant",
+                                                     "content": "👋 你好，我是枫独。描述一下你的经营情况吧，例如：\n\n**“我是温州个体工商户，开了2年，做摄影，月入3万，想申请创业补贴”**\n\n我会逐项问你几个关键问题，然后帮你预审材料。"}])
+                        with gr.Row():
+                            chat_input = gr.Textbox(placeholder="输入你的经营情况…", scale=6, container=False)
+                            send_btn = gr.Button("发送", elem_id="maple-btn", scale=1)
+                        status = gr.HTML()
+                        reset_btn = gr.Button("🔄 重新开始", elem_id="reset-btn", size="sm")
+                    with gr.Column(scale=5):
+                        cockpit = gr.HTML(render_cockpit(bp.empty_profile(), "wenzhou", partial=True))
+
+                profile_state = gr.State(bp.empty_profile())
+                chat_state = gr.State([])
+
+                send_btn.click(process_chat,
+                               [chat_input, profile_state, chat_state, region_dd],
+                               [chat_input, profile_state, region_dd, chatbot, cockpit, status])
+                chat_input.submit(process_chat,
+                                  [chat_input, profile_state, chat_state, region_dd],
+                                  [chat_input, profile_state, region_dd, chatbot, cockpit, status])
+
+                def on_region_change(region, profile):
+                    """切换地区 → 同步 profile 地区 + 立即重算驾驶舱（地区标题/政策跟随）。"""
+                    profile = profile or bp.empty_profile()
+                    region = region or "wenzhou"
+                    # region 可能是 code（wenzhou）或中文自定义（重庆）；存中文展示名
+                    profile["region"] = REGION_LABELS.get(region, region)
+                    if bp.is_complete(profile):
+                        try:
+                            summ = summary(profile, region)
+                            indices = compute_indices(profile, region)
+                            return profile, render_cockpit(profile, region, indices, summ, partial=False)
+                        except Exception:
+                            pass
+                    return profile, render_cockpit(profile, region, partial=True)
+                region_dd.change(on_region_change, [region_dd, profile_state], [profile_state, cockpit])
+
+                def do_reset():
+                    return bp.empty_profile(), [], [], render_cockpit(bp.empty_profile(), "wenzhou", partial=True), "已重置"
+                reset_btn.click(do_reset, None, [profile_state, chat_state, chatbot, cockpit, status])
+
+            # ---------- Tab2 经营诊断 ----------
+            with gr.Tab("② 经营健康诊断"):
+                gr.Markdown("> **场景**：填写（或一键带入示例）你的经营数据，AI 输出 6 维状态向量 + 三指数 + 行动建议。")
+                with gr.Row():
+                    with gr.Column(scale=5):
+                        d_region = gr.Dropdown(choices=region_choices, value="wenzhou", label="地区",
+                                               container=False, elem_classes="region-dd",
+                                               allow_custom_value=True)
+                        with gr.Row():
+                            d_reg_type = gr.Textbox(label="注册类型", placeholder="个体工商户 / 一人有限责任公司")
+                            d_industry = gr.Textbox(label="行业", placeholder="摄影 / 软件开发 / 餐饮…")
+                        with gr.Row():
+                            d_duration = gr.Textbox(label="经营时长", placeholder="2年")
+                            d_revenue = gr.Textbox(label="月营收", placeholder="3万")
+                        with gr.Row():
+                            d_social = gr.Textbox(label="社保", placeholder="有 / 无")
+                            d_buffer = gr.Textbox(label="现金流缓冲", placeholder="4个月")
+                        with gr.Row():
+                            d_client = gr.Textbox(label="客户集中度", placeholder="单客户60%")
+                            d_team = gr.Textbox(label="团队人数", placeholder="1人")
+                        d_edu = gr.Textbox(label="学历", placeholder="本科 / 专科 / 研究生")
+                        d_grad = gr.Textbox(label="毕业年份", placeholder="2022")
+                        d_materials = gr.Textbox(label="已有材料", placeholder="如：营业执照/身份证（逗号分隔）")
+                        with gr.Row():
+                            diag_btn = gr.Button("🔍 开始诊断", elem_id="maple-btn")
+                            prefill_btn = gr.Button("🍁 带入摄影师示例", elem_id="prefill-btn")
+                        diag_note = gr.HTML()
+                    with gr.Column(scale=5):
+                        d_cockpit = gr.HTML(render_cockpit(bp.empty_profile(), "wenzhou", partial=True))
+                        d_report = gr.Markdown()
+
+                def do_prefill():
+                    # 摄影师示例（PPT P7 案例）：带已有材料（营业执照/身份证）→ 驾驶舱显示「✅ 营业执照已备」
+                    vals = {"d_reg_type": "个体工商户", "d_industry": "摄影", "d_duration": "2年",
+                            "d_revenue": "3万", "d_social": "无", "d_buffer": "4个月",
+                            "d_client": "单客户60%", "d_team": "1人", "d_edu": "本科", "d_grad": "2022",
+                            "d_materials": "营业执照,身份证"}
+                    return [vals.get(k, "") for k in ["d_reg_type", "d_industry", "d_duration", "d_revenue",
+                                                       "d_social", "d_buffer", "d_client", "d_team", "d_edu",
+                                                       "d_grad", "d_materials"]]
+
+                def run_diag(region, reg_type, industry, duration, revenue, social, buffer, client, team, edu, grad, materials):
+                    inputs = {"reg_type": reg_type, "industry": industry, "duration": duration,
+                              "revenue": revenue, "social_security": social, "cash_buffer": buffer,
+                              "client_concentration": client, "team_size": team, "education": edu,
+                              "grad_year": grad, "has_materials": materials}
+                    return run_diagnosis(inputs, region)
+
+                prefill_btn.click(do_prefill, None,
+                                  [d_reg_type, d_industry, d_duration, d_revenue, d_social,
+                                   d_buffer, d_client, d_team, d_edu, d_grad, d_materials])
+                diag_btn.click(run_diag,
+                               [d_region, d_reg_type, d_industry, d_duration, d_revenue,
+                                d_social, d_buffer, d_client, d_team, d_edu, d_grad, d_materials],
+                               [d_cockpit, d_report])
+
+                def on_d_region_change(region):
+                    """Tab2 切换地区 → 驾驶舱标题跟随（未收录地区显示'未收录'）。"""
+                    region = region or "wenzhou"
+                    return render_cockpit(bp.empty_profile(), region, partial=True)
+                d_region.change(on_d_region_change, [d_region], [d_cockpit])
+
+            # ---------- Tab3 合规问答 ----------
+            with gr.Tab("③ 经营合规问答"):
+                gr.Markdown("> **场景**：问税务/合同/开票/社保问题。已接入 AI 深度回答，离线时由内置知识库兜底。")
+                c_chat = gr.Chatbot(height=430)
+                with gr.Row():
+                    c_input = gr.Textbox(placeholder="例如：一人公司报税有什么要注意的？", scale=6, container=False)
+                    c_btn = gr.Button("发送", elem_id="maple-btn", scale=1)
+                c_btn.click(compliance_chat, [c_input, c_chat], [c_chat, c_input])
+                c_input.submit(compliance_chat, [c_input, c_chat], [c_chat, c_input])
+
+            # ---------- Tab4 政策导入 ----------
+            with gr.Tab("④ 政策导入（多地区扩展）"):
+                gr.Markdown("> **场景**：你有某地真实政策原文 → 粘贴给 AI → 自动结构化入库该地区 → 地区下拉即可切换使用。\n\n⚠️ AI 结构化可能出错，入库后请人工核对与官方文件一致（零造假原则）。")
+                with gr.Row():
+                    imp_region = gr.Textbox(label="目标地区", value="杭州", placeholder="如：杭州 / 北京 / 广州")
+                    imp_btn = gr.Button("入库政策", elem_id="maple-btn")
+                imp_text = gr.Textbox(label="政策原文", lines=8,
+                                      placeholder="粘贴政策原文（含名称、金额、资格条件、申请材料、来源）…")
+                imp_result = gr.Markdown()
+                imp_btn.click(import_policy, [imp_region, imp_text], [imp_result])
+
+        gr.HTML('<div class="footnote">🍁 枫独 · OPC 经营助手 — GOAI 无界应用大赛 AI+金融 赛道演示。'
+                '数据来源：公开政策文件（温州 OPC 创业扶持申请操作指南等）。所有输出为辅助参考，'
+                '不替代专业机构/金融机构最终判断。政策以官方最新文件为准。</div>')
+
+    return demo
+
+
+if __name__ == "__main__":
+    demo = build_ui()
+    # Gradio 6.x：css/theme 移到 launch()
+    theme = gr.themes.Base(primary_hue="orange", neutral_hue="stone",
+                           font=["Microsoft YaHei", "sans-serif"])
+    demo.launch(server_name="0.0.0.0", server_port=7860, show_error=True,
+                css=CSS, theme=theme)
