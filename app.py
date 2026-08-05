@@ -610,16 +610,16 @@ def process_chat(user_text: str, profile: dict, chat: list, region: str):
         chat.append({"role": "assistant",
                      "content": f"✅ 已记录：{'、'.join(bp_summarize_key(k, v) for k, v in extracted.items() if k in new_keys)}"})
 
-    # 地区：用户消息里明确说的城市 > 下拉当前值 > 已有地区
+    # 地区：用户消息里明确说的城市 > 已有值 > 下拉当前值（兜底）
+    # 注意：extract 对已填字段不返回，所以"用户消息已说城市"= extracted['region'] 命中。
+    # 兜底只用下拉 code 转换中文，绝不覆盖用户已说的城市。
     if extracted.get("region"):
         profile["region"] = extracted["region"]
-    else:
-        # 下拉值优先（用户可能改了地区下拉/输入了自定义地区）
+    elif not profile.get("region"):
+        # 下拉值兜底（用户改了地区下拉/输入了自定义地区，且尚无地区）
         dd_region = REGION_LABELS.get(region, region) if region else ""
         if dd_region:
             profile["region"] = dd_region
-        else:
-            profile.setdefault("region", REGION_LABELS.get(region, region))
     region_out = _region_code(profile["region"])
     region_val = profile["region"]
 
@@ -637,10 +637,11 @@ def process_chat(user_text: str, profile: dict, chat: list, region: str):
     indices = compute_indices(profile, region_out)
     is_unknown = summ.get("region_status", "").startswith("通用参考")
 
-    # 未收录地区 → 实时搜索当地政策（优先）；失败给显式降级提示 + 通用方向
+    # 未收录地区 → 实时搜索当地政策（优先，按用户行业动态生成搜索词）；失败给显式降级提示
     search_block = ""
     if is_unknown:
-        search_block = policy_searcher.search_and_format(region_val)
+        search_block = policy_searcher.search_and_format(
+            region_val, keyword=policy_searcher._policy_query_for(profile, region_val))
         if not search_block:
             # 网络受限/搜索失败：不哑火，明确告知评委是环境限制，并引导本地通用库
             search_block = policy_searcher.unavailable_notice(region_val)
