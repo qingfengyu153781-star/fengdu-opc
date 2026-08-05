@@ -680,10 +680,9 @@ def process_chat(user_text: str, profile: dict, chat: list, region: str):
         # ---- 追问防死循环：同字段问满 3 次自动跳过；全部跳过则进诊断 ----
         prof_ask = dict(profile.get("_ask_count", {}))
         prof_skip = set(profile.get("_skip_fields", []))
-        # 本轮有进展（抽到新字段）→ 重置该字段计数（正常作答不算重复问）
+        # 本轮抽到新字段 → 正常交流，重置所有计数（防止"用户答别的字段"误触发跳过）
         if new_keys:
-            for k in new_keys:
-                prof_ask.pop(k, None)
+            prof_ask = {k: 0 for k in prof_ask}
         # 找一个"未跳过 3 次"的缺失字段来问
         target_key = None
         for f in bp.missing_fields(profile):
