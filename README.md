@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 # 🍁 枫独 · OPC 经营助手
 
 **GOAI 世界人工智能开源大赛 · 无界应用｜BoundlessAgents · AI+金融 赛道**
