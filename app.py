@@ -2,12 +2,13 @@
 """枫独 · OPC 经营助手 —— GOAI 无界应用大赛 AI+金融 赛道 Demo
 
 入口：python app.py
-架构：规则引擎（材料预审/经营诊断/风险评估，确定性）+ LLM（合规问答/政策导入，可选）
-零白屏保证：核心闭环纯规则引擎，LLM 无 key 时自动降级 mock → Demo 永不白屏。
+架构：联网搜索匹配（核心，需网络）+ 规则判定资格 + LLM（理解/搜索词/合规问答）
+联网搜索不可用（断网/受限）时：降级本地通用政策库 + 规则引擎 → 不白屏、不造假（保命兜底，非核心）
 
-运行前设置（可选，合规问答/政策导入才有真实 LLM）：
+运行前设置（增强 LLM 语义理解 / 搜索词生成 / 合规问答）：
     set MODELSCOPE_API_KEY=ms-xxx      (Windows)
     export MODELSCOPE_API_KEY=ms-xxx   (Linux)
+    （联网搜索更稳可配 BING_SEARCH_API_KEY 或 SEARXNG_URL）
 """
 import sys
 import re
@@ -576,6 +577,24 @@ def render_report(profile: dict, summ: dict, indices: dict, title: str = "预审
             lines.append(f"- **{p['name']}**（{p['amount']}）\n  · 条件：{'；'.join(p['eligibility'][:2])}\n  · 来源：{p['source']} [查看]({p['source_url']})")
         if len(local_matched) > 4:
             lines.append(f"  …还有 {len(local_matched)-4} 项")
+        # 顾问式解读（P5：激活 EXPLAIN_PROMPT，LLM 有 key 时对 top 政策生成；失败静默降级为纯规则列表）
+        if api_client.is_api_available():
+            try:
+                top = local_matched[0]
+                sys_p = agent_prompts.EXPLAIN_PROMPT.format(
+                    policy_name=top["name"],
+                    amount=top.get("amount", ""),
+                    eligibility="；".join(top.get("eligibility", [])[:3]),
+                    materials="、".join(m.get("name", "") for m in top.get("materials", [])[:3]) or "以官方清单为准",
+                    source=top.get("source", ""),
+                    source_url=top.get("source_url", ""),
+                    key_point=top.get("key_point", ""))
+                raw, _ = api_client.generate(sys_p, "", temperature=0.4, max_tokens=300)
+                txt = (raw or "").strip()
+                if txt:
+                    lines.append(f"\n🤖 **顾问解读**（{top['name']}）：\n{txt}")
+            except Exception:
+                pass  # LLM 失败 → 保持纯规则列表，不阻塞报告
     elif summ.get("region_status", "").startswith("通用参考") and not real_search:
         # 未收录地区且实时搜索失败 → 展示通用政策方向（零造假：标注需核验，不算可申请）
         lines.append("📌 实时搜索暂不可用，为你列出**常见政策方向**（具体以当地官方为准）：")
@@ -589,12 +608,17 @@ def render_report(profile: dict, summ: dict, indices: dict, title: str = "预审
         lines.append("  " + "、".join(p["name"] for p in national_matched))
 
     missing = [m for m in summ["checklist"] if m["status"] == "缺失"]
-    if missing:
-        lines.append(f"\n⚠️ **建议优先准备材料**（缺 {len(missing)} 项）：")
-        for m in missing[:5]:
-            lines.append(f"- {m['name']}" + (f"（{m['format_note']}）" if m.get("format_note") else ""))
-        if len(missing) > 5:
-            lines.append(f"  …共 {len(missing)} 项")
+    pending = [m for m in summ["checklist"] if m["status"] == "待确认"]
+    if missing or pending:
+        # 修复（S4）：缺失与待确认都需提示，不能只统计"缺失"——否则用户未确认材料时会误报"材料完整"
+        lines.append(f"\n⚠️ **建议准备/确认材料**（缺 {len(missing)} 项 · 待确认 {len(pending)} 项）：")
+        for m in (missing + pending)[:5]:
+            if m["status"] == "缺失":
+                lines.append(f"- {m['name']}" + (f"（{m['format_note']}）" if m.get("format_note") else ""))
+            else:
+                lines.append(f"- {m['name']}（待确认是否已备）")
+        if len(missing) + len(pending) > 5:
+            lines.append(f"  …共 {len(missing) + len(pending)} 项")
     else:
         lines.append("\n✅ 材料清单完整。")
 
@@ -698,13 +722,13 @@ def process_chat(user_text: str, profile: dict, chat: list, region: str):
     llm_ext = llm_extract_profile(user_text, profile)
     if llm_ext:
         extracted.update(llm_ext)
-    # ② 规则兜底：LLM 没抽到的字段用关键词/数字规则补充（保证无 key 也能跑）
+    # ② 规则兜底：LLM 没抽到的字段用句法模式/数字规则补充（零值枚举，不预置城市/行业表）
     rule_ext = bp.extract_from_text(user_text, profile)
     for k, v in rule_ext.items():
         if v and k not in extracted:
             extracted[k] = v
     # ③ 追问兜底：用户回答当前被问字段但都没抽到 → 尽力识别，保证进度前进
-    missing = bp.missing_fields(profile)
+    missing = bp.pending_ask(profile)
     if missing and missing[0]["key"] not in extracted and not profile.get(missing[0]["key"]):
         q_key = missing[0]["key"]
         if q_key in ("social_security", "corp_account", "biz_scope_ai"):
@@ -740,8 +764,9 @@ def process_chat(user_text: str, profile: dict, chat: list, region: str):
     region_out = _region_code(profile["region"])
     region_val = profile["region"]
 
-    if not bp.is_complete(profile):
+    if not bp.is_ask_complete(profile):
         # ---- 追问防死循环：同字段问满 3 次自动跳过；全部跳过则进诊断 ----
+        # 追问源 = 必填缺失 + 关键非必填（grad_year/team_size，决定政策匹配，P4 修复）
         prof_ask = dict(profile.get("_ask_count", {}))
         prof_skip = set(profile.get("_skip_fields", []))
         # 本轮抽到新字段 → 正常交流，重置所有计数（防止"用户答别的字段"误触发跳过）
@@ -749,7 +774,7 @@ def process_chat(user_text: str, profile: dict, chat: list, region: str):
             prof_ask = {k: 0 for k in prof_ask}
         # 找一个"未跳过 3 次"的缺失字段来问
         target_key = None
-        for f in bp.missing_fields(profile):
+        for f in bp.pending_ask(profile):
             if f["key"] not in prof_skip:
                 target_key = f["key"]
                 break
@@ -763,7 +788,7 @@ def process_chat(user_text: str, profile: dict, chat: list, region: str):
                              "content": f"▶️ 这个信息可以先跳过（已问多次未获有效回答），继续下一个问题。"})
                 # 重新找下一个未跳过的字段
                 target_key = None
-                for f in bp.missing_fields(profile):
+                for f in bp.pending_ask(profile):
                     if f["key"] not in prof_skip:
                         target_key = f["key"]
                         break
@@ -789,11 +814,14 @@ def process_chat(user_text: str, profile: dict, chat: list, region: str):
     indices = compute_indices(profile, region_out)
     is_unknown = summ.get("region_status", "").startswith("通用参考")
 
-    # 未收录地区 → 实时搜索当地政策（优先，按用户行业动态生成搜索词）；失败给显式降级提示
+    # 未收录地区 → 实时搜索当地政策（核心：搜索词=LLM理解行业生成，非类目穷举）；失败给显式降级提示
     search_block = ""
     if is_unknown:
-        search_block = policy_searcher.search_and_format(
-            region_val, keyword=policy_searcher._policy_query_for(profile, region_val))
+        # 有 key 时 LLM 生成精准搜索词（理解任意行业）；无 key 用用户原话行业兜底
+        llm_gen = (lambda s, u: api_client.generate(s, u, temperature=0.3, max_tokens=120)) \
+            if api_client.is_api_available() else None
+        keyword = policy_searcher.generate_query(region_val, profile, llm_gen)
+        search_block = policy_searcher.search_and_format(region_val, keyword=keyword)
         if not search_block:
             # 网络受限/搜索失败：不哑火，明确告知评委是环境限制，并引导本地通用库
             search_block = policy_searcher.unavailable_notice(region_val)
@@ -853,12 +881,15 @@ def run_diagnosis(profile_inputs: dict, region: str):
     indices = compute_indices(profile, region)
     cockpit = render_cockpit(profile, region, indices, summ, partial=False)
 
-    # 未收录地区 → 实时搜索当地政策（与 Tab1 一致）；失败给显式降级提示
+    # 未收录地区 → 实时搜索当地政策（与 Tab1 一致，搜索词=LLM/原话行业）；失败给显式降级提示
     search_block = ""
     if summ.get("region_status", "").startswith("通用参考"):
         # code（wenzhou/guangzhou…）→ 中文名；自定义输入（福建/广州…）直接用中文
         region_name = REGION_LABELS.get(region) or profile.get("region") or region
-        search_block = policy_searcher.search_and_format(region_name)
+        llm_gen = (lambda s, u: api_client.generate(s, u, temperature=0.3, max_tokens=120)) \
+            if api_client.is_api_available() else None
+        keyword = policy_searcher.generate_query(region_name, profile, llm_gen)
+        search_block = policy_searcher.search_and_format(region_name, keyword=keyword)
         if not search_block:
             search_block = policy_searcher.unavailable_notice(region_name)
 
@@ -1111,23 +1142,46 @@ def _parse_policy_rules(text: str) -> list[dict]:
     }]
 
 
+def _policy_name_ok(name: str) -> bool:
+    """导入政策名校验：防测试垃圾/纯数字污染政策库。
+
+    只拦明显垃圾（长度<4 / 纯数字 / 占位词），不拦真实政策名
+    （如"人才驿站免费住宿"可能不含'补贴/创业'字样，但对 _looks_like_policy 而言是合法的）。
+    """
+    n = (name or "").strip()
+    if len(n) < 4:
+        return False
+    if n.isdigit():
+        return False
+    if n in ("待补充", "以官方文件为准", "以当地官方为准", "待导入", "待核对"):
+        return False
+    return True
+
+
 def _write_policies_file(region: str, policies: list[dict]) -> int:
-    """把结构化政策写入 policies/<region>.py 并注册。"""
+    """把结构化政策写入 policies/<region>.py 并注册。
+
+    防护（P3 修复）：新导入 + 读回的历史政策都经过 _policy_name_ok 过滤，
+    杜绝 '11111' 这类测试垃圾再次入库。
+    """
     import os
 
     code = _slug(region)
     # policies 包目录 = 本文件所在目录下 policies/
     pkg_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "policies")
     path = os.path.join(pkg_dir, f"{code}.py")
-    # 若文件已存在，读回现有政策追加
+    # 若文件已存在，读回现有政策追加（同时过滤历史脏数据）
     existing = []
     if os.path.exists(path):
         try:
             import importlib
             mod = importlib.import_module(f"policies.{code}")
-            existing = list(getattr(mod, "POLICIES", []))
+            existing = [p for p in getattr(mod, "POLICIES", []) if _policy_name_ok(p.get("name", ""))]
         except Exception:
             existing = []
+
+    # 新导入同样过滤（LLM 结构化的 name 可能乱，规则解析可能抽到数字行）
+    policies = [p for p in policies if _policy_name_ok(p.get("name", ""))]
 
     nxt_id = len(existing) + 1
     for i, p in enumerate(policies):
@@ -1348,6 +1402,7 @@ def build_ui():
                             d_team = gr.Textbox(label="团队人数", placeholder="1人")
                         d_edu = gr.Textbox(label="学历", placeholder="本科 / 专科 / 研究生")
                         d_grad = gr.Textbox(label="毕业年份", placeholder="2022")
+                        d_order_cycle = gr.Textbox(label="订单周期", placeholder="如：1-3个月/单")
                         d_materials = gr.Textbox(label="已有材料", placeholder="如：营业执照/身份证（逗号分隔）")
                         with gr.Row():
                             diag_btn = gr.Button("🔍 开始诊断", elem_id="maple-btn")
@@ -1356,30 +1411,40 @@ def build_ui():
                     with gr.Column(scale=5):
                         d_cockpit = gr.HTML(render_cockpit(bp.empty_profile(), "wenzhou", partial=True))
                         d_report = gr.Markdown()
+                        # 算法透明度面板（P2-2g）：三指数怎么算，公式与代码一致，驳"查表器"质疑
+                        with gr.Accordion("🔍 三指数是怎么算的？（透明可解释）", open=False):
+                            gr.Markdown("""**健康指数** = 5 维等权 20% 平均：收入稳定性 + 现金流安全 + 成本控制 + 政策匹配 + 经营周期
+每维带打分理由（见下方报告）——非黑盒、可解释。
+
+**政策机会指数** = 地区差异化可申请政策数（国家级人人都有，不计入"机会"）。
+
+**风险指数** = 规则引擎综合等级（低 / 中 / 高），含客户集中度 / 社保缺口 / 现金流缓冲三类风险。""")
 
                 def do_prefill():
                     # 摄影师示例（PPT P7 案例）：带已有材料（营业执照/身份证）→ 驾驶舱显示「✅ 营业执照已备」
+                    # 含订单周期「1-3个月/单」→ 6 维状态向量第 3 维「订单生命周期」可判（与 PPT P7 一致，S3）
                     vals = {"d_reg_type": "个体工商户", "d_industry": "摄影", "d_duration": "2年",
                             "d_revenue": "3万", "d_social": "无", "d_buffer": "4个月",
                             "d_client": "单客户60%", "d_team": "1人", "d_edu": "本科", "d_grad": "2022",
+                            "d_order_cycle": "1-3个月/单",
                             "d_materials": "营业执照,身份证"}
                     return [vals.get(k, "") for k in ["d_reg_type", "d_industry", "d_duration", "d_revenue",
                                                        "d_social", "d_buffer", "d_client", "d_team", "d_edu",
-                                                       "d_grad", "d_materials"]]
+                                                       "d_grad", "d_order_cycle", "d_materials"]]
 
-                def run_diag(region, reg_type, industry, duration, revenue, social, buffer, client, team, edu, grad, materials):
+                def run_diag(region, reg_type, industry, duration, revenue, social, buffer, client, team, edu, grad, order_cycle, materials):
                     inputs = {"reg_type": reg_type, "industry": industry, "duration": duration,
                               "revenue": revenue, "social_security": social, "cash_buffer": buffer,
                               "client_concentration": client, "team_size": team, "education": edu,
-                              "grad_year": grad, "has_materials": materials}
+                              "grad_year": grad, "order_cycle": order_cycle, "has_materials": materials}
                     return run_diagnosis(inputs, region)
 
                 prefill_btn.click(do_prefill, None,
                                   [d_reg_type, d_industry, d_duration, d_revenue, d_social,
-                                   d_buffer, d_client, d_team, d_edu, d_grad, d_materials])
+                                   d_buffer, d_client, d_team, d_edu, d_grad, d_order_cycle, d_materials])
                 diag_btn.click(run_diag,
                                [d_region, d_reg_type, d_industry, d_duration, d_revenue,
-                                d_social, d_buffer, d_client, d_team, d_edu, d_grad, d_materials],
+                                d_social, d_buffer, d_client, d_team, d_edu, d_grad, d_order_cycle, d_materials],
                                [d_cockpit, d_report])
 
                 def on_d_region_change(region):

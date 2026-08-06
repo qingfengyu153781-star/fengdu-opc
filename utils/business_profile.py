@@ -1,8 +1,14 @@
 # -*- coding: utf-8 -*-
 """经营信息字段模型 + 追问状态机（主动询问核心）。
 
-设计：19 个经营信息字段。用户往往说不清自己情况（"我是什么类型的企业""我算不算科技人员"），
+设计：18 个经营信息字段。用户往往说不清自己情况（"我是什么类型的企业""我算不算科技人员"），
 所以 Agent 不依赖一次说清——缺哪些字段就逐项问，问全才进入匹配。这就是"主动询问"。
+
+抽取架构（v2，零值枚举）：**LLM 理解为主，规则只做兜底**。
+- 有 MODELSCOPE_API_KEY 时：app.llm_extract_profile 用模型理解任意表达（用户说什么就抽什么）。
+- 无 key / LLM 失败时：本模块只靠「纯句法模式 + 封闭选项 + 数字正则」兜底，**不预置任何
+  城市/行业表**——地区/行业是开放值，靠"在XX经营/注册""我(做|是|开)XXX"这类句法结构抓原文，
+  不做硬编码枚举（硬对应穷举删干净了）。
 
 优先级：region 最高（决定政策路由），其次是材料预审关键字段（注册类型/社保/学历/毕业年）。
 """
@@ -66,25 +72,26 @@ def empty_profile() -> dict:
     return {k: "" for k in FIELD_KEYS}
 
 
-# ---- 关键词规则抽取（确定性，不依赖 LLM） ----
+# ---- 兜底抽取规则（零值枚举，LLM 不可用时才走） ----
 # (字段 key, 正则, 提取函数)
+# 原则：删掉一切硬编码值表（不预置城市、不预置行业关键词）。
+# - region / industry：开放值，只靠句法模式（"在XX经营/注册""我(做|是|开)XXX"）抓用户原文
+# - reg_type / education / social_security / biz_scope_ai / corp_account：
+#   封闭选项字段，问句里已定义选项（"答：有/无"），按选项匹配不算穷举
+# - 数字字段走 _NUMBER_PARSERS（结构化数据，正则天然合适）
 _SPECIAL_PARSERS = {
     "region": [
-        (r"温州|wenzhou", lambda m: "温州"),
-        (r"杭州|hangzhou", lambda m: "杭州"),
-        (r"北京|beijing", lambda m: "北京"),
-        (r"上海|shanghai", lambda m: "上海"),
-        (r"广州|guangzhou", lambda m: "广州"),
-        (r"深圳|shenzhen", lambda m: "深圳"),
-        (r"福建|福建省|fujian", lambda m: "福建"),
-        (r"南京|nanjing", lambda m: "南京"),
-        (r"成都|chengdu", lambda m: "成都"),
-        (r"武汉|wuhan", lambda m: "武汉"),
-        (r"重庆|chongqing", lambda m: "重庆"),
-        (r"西安|xian|西安", lambda m: "西安"),
-        (r"苏州|suzhou", lambda m: "苏州"),
-        # 通用兜底：在XX(注册/经营/创业…) → 提取城市名
-        (r"在([一-龥]{2,8}?)(?:注册|经营|开(?:了|个|的)?|创业|做生意|发展|上班)", lambda m: m.group(1)),
+        # 句法模式①："在XX(注册|经营|创业|做生意|上班…)" → XX 为地区（地点+经营动作结构）
+        (r"在([一-龥]{2,8}?)(?:注册|经营|开(?:了|个|的)?|创业|做生意|发展|上班|做|搞)",
+         lambda m: m.group(1)),
+        # 句法模式②："我是温州个体工商户" → 注册类型标记前的词为地区（地点+注册类型结构）。
+        # 守卫：若捕获词含动作动词（"我是做摄影的个体户"）→ 拒绝，交给下拉兜底，绝不猜错地区
+        (r"我(?:是|在)?([一-龥]{2,8}?)(?:个体工商户|个体户|一人公司|一人有限责任公司|有限责任公司|有限公司|公司)",
+         lambda m: m.group(1) if not any(v in m.group(1) for v in ("做", "搞", "从事", "干", "开", "经营")) else ""),
+        # 句法模式③："我是宁波做宠物殡葬的" → 动词前的词为地区（地点+行业结构）。
+        # "做/搞/从事"前无字（"我是做摄影的"）→ 不匹配，绝不猜错
+        (r"我(?:是|在)?([一-龥]{2,8}?)(?:做|搞|从事|干|开|经营)([一-龥]{2,10})",
+         lambda m: m.group(1)),
     ],
     "reg_type": [
         (r"个体工商户|个体户|个体", lambda m: "个体工商户"),
@@ -110,23 +117,24 @@ _SPECIAL_PARSERS = {
         (r"有.*对公|对公.*有", lambda m: "有"),
         (r"没(有)?对公|对公.*没", lambda m: "无"),
     ],
-    "industry": [
-        (r"摄影|拍照|摄像|剪辑", lambda m: "摄影"),
-        (r"软件|程序|开发|编程|AI|人工智能", lambda m: "软件开发"),
-        (r"餐饮|外卖|饭店", lambda m: "餐饮"),
-        (r"咨询", lambda m: "咨询"),
-        (r"设计|平面|视觉", lambda m: "设计"),
-        (r"电商|淘宝|拼多多|网店", lambda m: "电商"),
+    "has_materials": [
+        # 材料列表：识别"有/已有/已备 X"结构（带"没/无"守卫防误抓"没有营业执照"）
+        # 一次抓一个材料（常见演示：用户一句话说"有营业执照"），多处靠后续追问/补充
+        (r"(?<!没)(?<!无)(?:已有|已备|准备好了|手里|手上|目前有|有).{0,8}?(营业执照|身份证|毕业证|学位证|公章|发票|社保缴纳记录|社保缴费证明|劳动合同|商业计划书|软著|软件产品登记证书|软件著作权证书|章程|对公账户|银行开户许可证|经营场所证明)",
+         lambda m: m.group(1)),
+        # 纯罗列式："营业执照和身份证都有" / "材料有营业执照"
+        (r"(?:材料|证件|资料).{0,4}?(?:有|已有)(营业执照|身份证|毕业证|公章)", lambda m: m.group(1)),
     ],
+    # 注意：industry 无硬编码关键词表——开放值，统一走 extract_industry_free 纯句法模式
 }
 
 
 def extract_industry_free(text: str) -> str:
-    """行业自由文本识别（纯模式，零穷举）。
+    """行业自由文本识别（纯句法模式，零值枚举）。
 
-    卖点哲学同搜索：不预置任何行业表，用户说什么行业就识别什么。
-    只靠模式"我(做|从事|搞|是|干|开|经营)XXX"，把 XXX 原文提取为行业。
-    任何行业（金融/教培/宠物殡葬/元宇宙…）都能识别，无一例外。
+    行业是开放值，与政策搜索同哲学：不预置任何行业表，用户说什么行业就识别什么。
+    只靠句法模式"我(做|从事|搞|是|干|开|经营)XXX"，把 XXX 原文提取为行业。
+    任何行业（金融/教培/宠物殡葬/元宇宙…）都能识别，无一例外——这是句法，不是穷举。
     """
     t = (text or "").strip()
     if not t:
@@ -138,7 +146,7 @@ def extract_industry_free(text: str) -> str:
     if m:
         ind = m.group(1).strip()
         # 去掉"的/了/行业/公司"等词尾
-        ind = re.sub(r"(的|了|行业|类|方面|生意|公司|个体户|工作|项目|这一行)$", "", ind)
+        ind = re.sub(r"(的|了|行业|类|方面|生意|公司|个体户|工作室|店|工作|项目|这一行)$", "", ind)
         if ind and len(ind) >= 2:
             return ind
     # 模式2：我是做XXX / 我是搞XXX（"做/搞"在"是"后，单独匹配）
@@ -155,7 +163,7 @@ def extract_industry_free(text: str) -> str:
     m4 = re.search(r"(?:我|本人)?(开|做|搞|干)([一-龥]{2,10}?)(?:的|店|行业|类)?$", t)
     if m4 and m4.group(2):
         ind = m4.group(2).strip()
-        ind = re.sub(r"(的|了|行业|类|方面|生意|公司|个体户|工作|项目|这一行)$", "", ind)
+        ind = re.sub(r"(的|了|行业|类|方面|生意|公司|个体户|工作室|店|工作|项目|这一行)$", "", ind)
         if ind and len(ind) >= 2:
             return ind
     # 模式5：纯"我XXX的"（无动词）
@@ -165,8 +173,8 @@ def extract_industry_free(text: str) -> str:
         ind = m5.group(1).strip()
         # 去掉注册类型/地区前缀（个体户/个体工商户/一人公司），取剩余为行业
         ind = re.sub(r"^(个体工商户|个体户|一人公司|一人有限责任公司|有限公司|公司)", "", ind)
-        # 若是纯注册类型/地区（无行业），返回空
-        if ind and len(ind) >= 2 and not any(k in ind for k in ("个体户", "公司", "温州", "杭州", "上海", "北京")):
+        # 若是纯注册类型（无行业），返回空（注册类型词是封闭选项，不枚举地区）
+        if ind and len(ind) >= 2 and not any(k in ind for k in ("个体户", "公司")):
             return ind
     return ""
 
@@ -260,21 +268,23 @@ _NUMBER_PARSERS = {
 
 
 def extract_field_value(text: str, key: str) -> str:
-    """从一句话里用关键词规则抽取单个字段值（确定性，用于 mock/兜底）。"""
+    """从一句话里抽取单个字段值（确定性兜底，无 key / LLM 失败时用，零值枚举）。"""
     text = text.strip()
-    # 特化规则（枚举型字段）
+    # 封闭选项 / 地区句法模式
     if key in _SPECIAL_PARSERS:
         for pattern, fn in _SPECIAL_PARSERS[key]:
             m = re.search(pattern, text, re.IGNORECASE)
             if m:
-                return fn(m)
-    # 数字型字段
+                v = fn(m)
+                if v:  # 空结果（守卫拒绝，如"我是做摄影的个体户"）→ 继续下一个模式，不猜
+                    return v
+    # 数字型字段（结构化数据，正则天然合适）
     if key in _NUMBER_PARSERS:
         for pattern, fn in _NUMBER_PARSERS[key]:
             m = re.search(pattern, text, re.IGNORECASE)
             if m:
                 return fn(m)
-    # 行业自由文本（纯模式，零穷举）：关键词没抽到 → 用"我做XXX"模式识别任意行业
+    # 行业自由文本（纯句法模式，零值枚举）：行业关键词表已删除，统一走这里
     if key == "industry":
         v = extract_industry_free(text)
         if v:
@@ -329,7 +339,7 @@ def parse_yes_no(text: str) -> str:
 
 
 def extract_from_text(text: str, profile: dict | None = None) -> dict:
-    """从用户一句话抽取多个字段值，合并进 profile（关键词规则版）。
+    """从用户一句话抽取多个字段值，合并进 profile（句法模式 + 封闭选项兜底版，零值枚举）。
 
     Returns: {field_key: value} 只含本次识别出的字段。
     """
@@ -379,9 +389,26 @@ def missing_fields(profile: dict) -> list[dict]:
     return missing
 
 
+# 非必填但直接影响政策匹配的关键字段（P4 修复：材料预审必填问完后继续问这些，
+# 否则温州 S1/S2/S9（毕业5年）S4（招人）等永远判 unknown → 地区匹配恒为 0）
+OPTIONAL_ASK_KEYS = ["grad_year", "team_size"]
+
+
+def pending_ask(profile: dict) -> list[dict]:
+    """追问源：必填缺失 + 关键非必填未填（按 priority 排序）。
+
+    材料预审的"完整"= 必填齐 + 关键非必填齐，保证匹配真实可判（不因缺字段恒 unknown）。
+    """
+    missing = missing_fields(profile)
+    for f in sorted(FIELDS, key=lambda x: x["priority"]):
+        if f["key"] in OPTIONAL_ASK_KEYS and not profile.get(f["key"]):
+            missing.append(f)
+    return missing
+
+
 def next_question(profile: dict) -> str | None:
     """返回下一个要问的问题（缺失字段的第一个），全部问完返回 None。"""
-    missing = missing_fields(profile)
+    missing = pending_ask(profile)
     if not missing:
         return None
     return missing[0]["ask"]
@@ -390,6 +417,17 @@ def next_question(profile: dict) -> str | None:
 def is_complete(profile: dict) -> bool:
     """全部必填字段是否齐全。"""
     return len(missing_fields(profile)) == 0
+
+
+def is_ask_complete(profile: dict) -> bool:
+    """追问是否全完成（必填齐 + 关键非必填齐）。
+
+    诊断填表路径只用 is_complete（不强制非必填）；材料预审对话路径用这个，
+    保证"毕业年份/团队规模"这两个决定政策匹配的字段不缺失。
+    """
+    if not is_complete(profile):
+        return False
+    return all(profile.get(k) for k in OPTIONAL_ASK_KEYS)
 
 
 def summarize(profile: dict) -> str:

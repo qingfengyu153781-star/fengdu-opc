@@ -12,11 +12,11 @@
 
 **产品**：用户输入经营情况 → 系统匹配可申请政策 → 预审材料清单 → 提示资格风险。核心是「材料预审 + 经营诊断」闭环。
 
-**技术**：**规则引擎（确定性）为主 + LLM（可选增强）为辅** 的混合架构，不是纯聊天机器人。
+**技术**：**联网搜索匹配（核心）+ 规则判定资格 + LLM（语义理解）** 的混合架构，不是纯聊天机器人。
 
-- 政策匹配、材料清单、风险判定全部是纯 Python 规则，**100% 可复现、无 key 也能跑**。
-- LLM 只做 4 件锦上添花的事：追问润色、非结构化抽取增强、政策导入结构化、合规问答。
-- 保证 **Demo 永不白屏**：核心闭环零 API 依赖，LLM 无 key 时自动降级。
+- **核心 = 联网搜索当地政策**（Bing/DDG/百度 多源，可配 Bing API/SearXNG 更稳）→ 规则判定资格 → 材料清单 → 风险提示。
+- **LLM 负责理解**：语义抽取任意行业/地区、生成精准搜索词、合规问答、政策导入结构化（不是可有可无的"增强"，是理解层）。
+- **断网保底**：联网搜索不可用（断网/受限）时降级本地通用库 + 规则引擎 → 不白屏、不造假（保命兜底，非核心卖点）。
 
 ---
 
@@ -32,11 +32,11 @@
 
 | 层 | 模块 | 职责 | 确定性 |
 |----|------|------|:--:|
-| 输入理解 | `utils/business_profile.py` | 18 字段经营信息模型 + 追问状态机 + 关键词抽取 | ✅ 规则 |
+| 输入理解 | `utils/business_profile.py` | 18 字段经营信息模型 + 追问状态机 + 句法模式抽取（零值枚举） | ✅ 规则 |
 | 政策匹配 | `utils/rule_engine.py` | 资格条件逐条判定、材料清单、风险评估 | ✅ 规则 |
 | 经营诊断 | `utils/state_model.py` | 6 维状态向量 + 三指数（透明可解释） | ✅ 规则 |
 | 实时搜索 | `utils/policy_searcher.py` | 未收录地区实时搜索当地政策（Bing→DDG→百度） | ✅ 规则 |
-| LLM（可选） | `utils/api_client.py` | ModelScope 免费推理 API，4 模型 fallback 链 | ⚠️ 有 key 才用 |
+| LLM（语义理解） | `utils/api_client.py` | ModelScope 免费推理 API，4 模型 fallback 链；负责任意行业/地区理解、搜索词生成、合规问答 | ⚠️ 有 key 才用 |
 | 提示词 | `prompts/agent_prompts.py` | 6 组 prompt 模板（人格/追问/抽取/解释/问答/导入） | ⚠️ 有 key 才用 |
 | 政策数据 | `policies/` | 按地区分库（national 通用 + 温州真实 + 杭州占位 + general 兜底） | ✅ 数据 |
 | UI 入口 | `app.py` | Gradio 6.x 枫叶主题，4 个 Tab + 驾驶舱 | — |
@@ -58,7 +58,7 @@ demo/
 │   ├── general.py        # 通用政策方向（未收录地区兜底，零造假）
 │   └── region_template.py# 新地区模板
 ├── utils/
-│   ├── business_profile.py # 18 字段模型 + 追问状态机 + 关键词/数字抽取
+│   ├── business_profile.py # 18 字段模型 + 追问状态机 + 句法/数字抽取（零值枚举）
 │   ├── rule_engine.py    # 政策匹配（三态）+ 材料清单 + 风险评估
 │   ├── state_model.py    # 6 维状态向量 + 三指数
 │   ├── policy_searcher.py# 实时政策搜索（零 key，多源）
@@ -80,16 +80,16 @@ demo/
 ```
 process_chat(user_text, profile, chat, region)
   │
-  ├─ 规则抽取字段（extract_from_text，关键词正则）
+  ├─ 规则抽取字段（extract_from_text，句法模式+封闭选项，零值枚举；LLM 有 key 时优先理解）
   ├─ 兜底抽取（回答当前被问字段但没抽到 → yes/no / 宽松数字 / 短文本直录）
   ├─ 地区判定：用户消息里说的城市 > 下拉当前值 > 已有值
   │
-  ├─ 若必填字段未齐 → next_question() 返回下一个问题
+  ├─ 若追问未完成（必填缺失 + 关键非必填 grad_year/team_size 未填，P4）→ next_question()
   │     · LLM 可用 → polish_question() 润色成大白话
   │     · LLM 不可用 → 直接给规则问题（自带选项提示）
   │     · 同步渲染「采集进度」驾驶舱
   │
-  └─ 若必填字段齐 → 出报告：
+  └─ 若追问完成（必填 + 关键非必填齐或已跳过）→ 出报告：
         summary(profile, region)     # 匹配政策 + 材料清单 + 风险
         compute_indices(profile, region)  # 三指数
         render_report()               # 政策/材料/风险三段文本
@@ -164,14 +164,18 @@ process_chat(user_text, profile, chat, region)
 - `next_question(profile)`：返回第一个缺失字段的 `ask` 问题；全齐返回 None。
 - `is_complete(profile)`：必填字段是否齐全。
 
-**关键词规则抽取**（确定性，不依赖 LLM）：
+**抽取架构（v2，零值枚举）**：LLM 理解为主，规则只做兜底。
 
-- `_SPECIAL_PARSERS`：枚举型字段（region/reg_type/social_security/education/biz_scope_ai/corp_account/industry），正则优先匹配。
-  - **坑点**：social_security 正则里 `有|交|缴` 最后兜底，但**特意不含「是」**——"我是XX"的"是"会误判为有社保。
-- `_NUMBER_PARSERS`：数字型字段（revenue/duration/cash_buffer/grad_year/team_size/client_concentration/order_cycle），支持中文数字（`_cn_to_int` / `_cn_to_num_text`，含"万/千/百/十"）。
-- `extract_loose_number`：追问兜底时从回答里提第一个数字（revenue 无单位按"元/月"，duration 无单位按"年"）。
-- `parse_yes_no`：通用有/无解析（有/没有/交了/没交 → 有/无）。
-- `parse_llm_json`：解析 LLM 抽取输出（去 ```json``` 块、截取 `{...}`、只留已知字段）。
+- **有 `MODELSCOPE_API_KEY`**：`app.llm_extract_profile` 用模型理解任意表达（不穷举），`EXTRACT_PROMPT` 明确要求 region/industry 是开放值、输出原话、不映射固定表。
+- **无 key / LLM 失败**：`extract_from_text` 兜底，**零值枚举**——不预置任何城市/行业表：
+  - `_SPECIAL_PARSERS["region"]`：纯句法模式（"在XX经营/注册""我是温州个体工商户"→注册类型标记前的词为地区）。守卫：捕获词含动作动词（"我是做摄影的个体户"）→ 拒绝，交给下拉兜底，绝不猜错地区。
+  - `_SPECIAL_PARSERS["industry"]`：**已删除关键词表**。行业是开放值，统一走 `extract_industry_free` 纯句法模式（"我(做|是|开)XXX"抓原文，任意行业可识别）。
+  - 封闭选项字段（reg_type/social_security/education/biz_scope_ai/corp_account）：按字段自带 `options` 匹配，不算穷举。
+    - **坑点**：social_security 正则里 `有|交|缴` 最后兜底，但**特意不含「是」**——"我是XX"的"是"会误判为有社保。
+  - `_NUMBER_PARSERS`：数字型字段（revenue/duration/cash_buffer/grad_year/team_size/client_concentration/order_cycle），支持中文数字（`_cn_to_int` / `_cn_to_num_text`，含"万/千/百/十"）。
+  - `extract_loose_number`：追问兜底时从回答里提第一个数字（revenue 无单位按"元/月"，duration 无单位按"年"）。
+  - `parse_yes_no`：通用有/无解析（有/没有/交了/没交 → 有/无）。
+  - `parse_llm_json`：解析 LLM 抽取输出（去 ```json``` 块、截取 `{...}`、只留已知字段）。
 
 > 修改字段清单 = 改 `FIELDS` 数组即可，追问状态机、驾驶舱进度、抽取都自动跟随。
 
@@ -243,7 +247,10 @@ process_chat(user_text, profile, chat, region)
 
 - **多源尝试**：Bing → DuckDuckGo → 百度，逐个尝试，全部失败返回空列表。
 - **零造假**：返回的是搜索引擎真实结果（标题+URL+摘要），带来源可溯源；摘要来自搜索结果页，提示"需点开核验"。
-- `search_policies(region, keyword)`：`{region} 创业补贴 政策 申请条件 2026`。
+- **`generate_query(region, profile, llm_fn)`：零值枚举搜索词**（核心：搜索词=模型理解，不是类目穷举）。
+  - LLM 可用 → 根据行业+经营特点生成精准搜索词（覆盖任意行业，不映射固定类目表）。
+  - LLM 不可用 → 用户原话行业词直接拼（`{region} {行业} 创业 补贴 政策 2026`），跟 business_profile 同哲学。
+- `search_policies(region, keyword)`：多轮补搜（配真后端时最多 3 轮，免费爬虫 1 轮）。
 - `search_and_format` / `format_web_search`：格式化成报告段落，失败返回空串（由上层回退通用库）。
 
 > ⚠️ 创空间若限制外网出站，搜索可能失败 → 架构已兜底（回落通用库 + LLM），不白屏。属正常降级。
@@ -252,7 +259,7 @@ process_chat(user_text, profile, chat, region)
 
 - 端点：`https://api-inference.modelscope.cn/v1/`（OpenAI 兼容协议）。
 - **fallback 链**：`Qwen3-235B-A22B-Instruct-2507 → Qwen3-235B-A22B → Qwen3-30B-A3B-Instruct-2507 → Qwen3-8B`。
-- `is_api_available()`：无 `MODELSCOPE_API_KEY` 时返回 False → 上层走 mock/规则，**核心闭环永不依赖 LLM**。
+- `is_api_available()`：无 `MODELSCOPE_API_KEY` 时返回 False → LLM 语义理解不可用，降级句法抽取 + 规则匹配（保底，非核心）。
 - 参数：TIMEOUT=60、MAX_ATTEMPTS=2（演示场景 2 轮足够，等太久会白屏）、指数退避 `sleep(2**attempt)`、`enable_thinking=False`。
 - 两个入口：`chat()`（多轮，合规问答/追问润色）、`generate()`（单轮低温度，政策导入结构化）。
 
@@ -297,28 +304,43 @@ process_chat(user_text, profile, chat, region)
 | 三指数 + 6 维向量 | `state_model.compute_indices(profile, region)` |
 | 行动建议 | `state_model.build_recommendations(profile, indices)` |
 | 实时搜当地政策 | `policy_searcher.search_and_format(region)` |
-| LLM 调用（可选） | `api_client.chat() / generate()` |
+| LLM 调用（语义理解） | `api_client.chat() / generate()` |
 | 渲染驾驶舱 | `app.render_cockpit(profile, region, indices, summ)` |
 
 ---
 
 ## 七、零白屏与降级设计
 
-**核心铁律：核心闭环（预审/诊断/风险）纯规则引擎，不依赖 API。LLM 仅用于可选增强，无 key 时自动降级 mock → Demo 永不白屏。**
+**核心铁律：核心 = 联网搜索当地政策（需网络）+ 规则判定资格。断网/受限时降级本地通用库 → 不白屏、不造假（保底，非核心）。LLM 是语义理解层（任意行业/搜索词/合规问答），非"可选增强"。**
 
-| 场景 | 有 key | 无 key |
+| 场景 | 有 key | 无 key（LLM 不可用） |
 |------|--------|--------|
-| 材料预审 | 规则匹配 + LLM 润色追问 | 规则匹配 + 规则问题（自带选项提示） |
+| 材料预审 | LLM 语义抽取 + 规则匹配 + LLM 润色追问 | 句法抽取 + 规则匹配 + 规则问题（自带选项提示） |
 | 经营诊断 | 规则三指数 | 规则三指数（同一结果） |
 | 合规问答 | LLM + 联网 + 知识库 | 内置 COMPLIANCE_MOCK 知识库 + 联网 |
 | 政策导入 | LLM 结构化 → 规则解析兜底 | 规则解析直接入库 |
 | 未收录地区 | 实时搜索 + LLM 政策方向 | 实时搜索 → 失败回落 general 通用方向 |
 
-**降级链顺序（都失败不回崩）**：LLM → 规则/关键词 → mock/通用库。
+**降级链顺序（都失败不回崩）**：LLM → 句法/规则兜底（零值枚举）→ mock/通用库。
 
 ---
 
-## 八、部署指南
+## 七·五、2026-08-06 审查修复（P1-P6）
+
+| 编号 | 问题 | 修复 |
+|------|------|------|
+| P1 | 演示脚本镜头1 声称"符合3项地区政策"但输入（毕业超5年）实际匹配 0 项 | 镜头1 输入改为"2022年毕业"（实测验证输出 3 项地区政策 + 72/3/中），数字均实测，非预编 |
+| P2 | 同一摄影师案例身份冲突（镜头1"毕业超5年" vs do_prefill"2022"） | 统一为 2022 毕业；对话版与填表版现在都真实输出 72/3/中 |
+| P3 | 杭州政策库脏数据 `[IMP-2] 11111` | 已删；`_write_policies_file` 加 `_policy_name_ok` 防护（长度≥4/非纯数字/非占位词），新导入+读回历史都过滤 |
+| P4 | 材料预审对话路径不问关键非必填 → 地区匹配恒为 0 | `business_profile` 加 `OPTIONAL_ASK_KEYS=["grad_year","team_size"]` + `pending_ask`/`is_ask_complete`；process_chat 改用之，必填问完后继续问关键非必填 |
+| P5 | `EXPLAIN_PROMPT` 死代码（定义未调用） | `render_report` 对 top 地区政策接入顾问式解读（有 key 时，失败静默降级纯规则） |
+| P6 | README"三个场景"过时 | 改为"四个场景" |
+
+另修复：region 句法模式③"我是[城市]做[行业]"（如"我是宁波做宠物殡葬的"→宁波），原缺口会错落回下拉默认温州。
+
+---
+
+## 九、部署指南
 
 ### 8.1 本地运行
 
@@ -355,7 +377,7 @@ export MODELSCOPE_API_KEY=ms-xxx
 
 ---
 
-## 九、扩展新地区
+## 十、扩展新地区
 
 **方法一：政策导入（推荐，零代码）**
 1. Tab ④ 填地区名 + 粘贴真实政策原文 → 入库（AI 结构化优先，规则解析兜底）。
@@ -373,7 +395,7 @@ export MODELSCOPE_API_KEY=ms-xxx
 
 ---
 
-## 十、测试与验收
+## 十一、测试与验收
 
 ### 10.1 验收基准（与 PPT 一致）
 
@@ -384,7 +406,7 @@ export MODELSCOPE_API_KEY=ms-xxx
 | 项 | 动作 | 期望 |
 |----|------|------|
 | ①材料预审 | "我是温州的个体户摄影师，开了2年，月入3万" | 逐项追问 → 材料清单 + 三指数 |
-| ①追问兜底 | 被问社保时答"没交" | 关键词兜底识别为"无"，进度前进 |
+| ①追问兜底 | 被问社保时答"没交" | 封闭选项兜底识别为"无"，进度前进 |
 | ②诊断 | 填表/摄影师示例 | 三指数驾驶舱 + 报告 |
 | ③合规问答 | "小规模纳税人月销售额多少免征增值税" | 带来源回答（无 key 走 mock） |
 | ④政策导入 | 粘贴真实政策原文 | 入库 + 地区下拉出现新地区 |
@@ -400,7 +422,7 @@ export MODELSCOPE_API_KEY=ms-xxx
 
 ---
 
-## 十一、合规边界
+## 十二、合规边界
 
 | 红线 | 规则 |
 |------|------|
@@ -413,7 +435,7 @@ export MODELSCOPE_API_KEY=ms-xxx
 
 ---
 
-## 十二、已知限制与后续（诚实边界）
+## 十三、已知限制与后续（诚实边界）
 
 - **政策会变**：手工维护的库有更新滞后风险。长期方向：`policy_updater` 自动爬取更新（待实现）。
 - **规则覆盖率**：`_check_condition` 已覆盖主流条件类，但**未识别的条件返回 unknown**，不猜。复赛可补自动抽取规则结构（研究笔记 §四-4 提到的待验证假设）。

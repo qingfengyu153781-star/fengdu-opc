@@ -462,34 +462,40 @@ def search_policies(region: str, keyword: str = "创业补贴 政策",
     return _merge_dedup(all_results)
 
 
-def _policy_query_for(profile: dict, region: str) -> str:
-    """根据用户经营信息生成精准搜索词（纯规则，零 key）。
+def generate_query(region: str, profile: dict | None = None, llm_fn=None) -> str:
+    """零值枚举生成搜索词（核心：搜索词=模型理解，不是类目穷举）。
 
-    行业/意图 → 对应政策类目词；地区 → 城市名。覆盖"问什么有什么"。
+    - LLM 可用（传入 llm_fn，返回 (text, model)）：让模型根据行业+经营特点生成精准搜索词，
+      覆盖任意行业（宠物殡葬/直播带货/元宇宙…），不映射任何固定类目表。
+    - LLM 不可用：直接用用户原话行业词拼进搜索词（跟 business_profile 同哲学——
+      用户说什么行业就搜什么，不做硬编码 if/elif 映射）。
     """
-    ind = (profile or {}).get("industry") or ""
-    reg_type = (profile or {}).get("reg_type") or ""
+    ind = ((profile or {}).get("industry") or "").strip()
+    reg_type = ((profile or {}).get("reg_type") or "").strip()
+    region = (region or "").strip()
 
-    # 行业 → 政策类目
-    cat = "创业补贴 政策"
-    if any(k in ind for k in ("软件", "AI", "开发", "科技", "研发")):
-        cat = "软件企业 税收优惠 研发补贴 政策"
-    elif any(k in ind for k in ("摄影", "设计", "文化", "传媒")):
-        cat = "文化创意 创业补贴 就业政策"
-    elif any(k in ind for k in ("餐饮", "外卖", "食品")):
-        cat = "餐饮 创业补贴 就业政策"
-    elif any(k in ind for k in ("电商", "淘宝", "网店")):
-        cat = "电商 创业补贴 灵活就业 政策"
-    elif any(k in ind for k in ("咨询", "服务")):
-        cat = "现代服务 创业补贴 政策"
+    # ① LLM 生成精准搜索词（理解任意行业/经营特点）
+    if llm_fn is not None:
+        try:
+            sys_p = (
+                "你是政策检索专家。根据用户行业与经营信息，生成 1 条搜索引擎查询词（中文），"
+                "用于搜当地针对该行业的创业/税收/补贴政策。只输出查询词本身，不要解释。"
+                f"行业：{ind or '未知'}；注册类型：{reg_type or '未知'}；地区：{region}。"
+            )
+            text, _ = llm_fn(sys_p, "")
+            q = (text or "").strip().split("\n")[0].strip().strip("“”\"'。")
+            # 修复（L3）：and 优先于 or，原式会把"只含补贴但不限长度"误判通过 → 用括号明确分组
+            if 4 <= len(q) <= 40 and ("政策" in q or "补贴" in q or "税收" in q or "支持" in q):
+                return q
+        except Exception:
+            pass  # LLM 失败 → 降级原话兜底，绝不白屏
 
-    # 注册类型 → 补充
-    if "个体" in reg_type:
-        cat += " 个体工商户"
-    elif "一人" in reg_type or "公司" in reg_type:
-        cat += " 小微企业"
-
-    return f"{region} {cat} 官方 2026"
+    # ② 无 key / LLM 失败：用户原话行业词直接拼（零值枚举，不映射类目）
+    base = f"{region} 创业 补贴 政策 2026"
+    if ind:
+        # 行业是用户原话（如"宠物殡葬"），直接作为核心词，不查类目表
+        return f"{region} {ind} 创业 补贴 政策 2026"
+    return base
 
 
 def unavailable_notice(region: str) -> str:
