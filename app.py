@@ -653,6 +653,26 @@ def _looks_like_policy(text: str) -> bool:
                                    "企业", "就业", "创业", "认定", "申报"))
 
 
+def llm_extract_profile(user_text: str, profile: dict) -> dict:
+    """LLM 理解用户自然语言 → 抽取经营字段（不穷举，模型理解任意表达）。
+
+    架构：LLM 优先理解，规则仅无 key 兜底。有 MODELSCOPE_API_KEY 时，
+    用户说"我做直播带货的"由模型理解输出 industry=直播带货，而非正则穷举。
+    失败静默返回空 dict，由规则兜底。
+    """
+    if not api_client.is_api_available():
+        return {}
+    try:
+        sys_p = agent_prompts.EXTRACT_PROMPT.format(user_text=user_text)
+        user_p = f"当前已收集的经营信息：{bp.to_llm_context(profile)}。只抽取本次新增的字段。"
+        raw, _ = api_client.generate(sys_p, user_p, temperature=0.2, max_tokens=800)
+        parsed = bp.parse_llm_json(raw)
+        # 过滤：只保留不在 profile 里的新增字段（LLM 理解更准，覆盖规则结果）
+        return {k: v for k, v in parsed.items() if v and not profile.get(k)}
+    except Exception:
+        return {}
+
+
 def process_chat(user_text: str, profile: dict, chat: list, region: str):
     """材料预审：用户输入 → 抽取字段 → 追问 or 出报告。
 
@@ -672,10 +692,18 @@ def process_chat(user_text: str, profile: dict, chat: list, region: str):
         return ("", profile, region_out, chat,
                 render_cockpit(profile, region_out, partial=True), "⛔ 已拦截")
 
-    # 规则抽取字段（确定性）
-    extracted = bp.extract_from_text(user_text, profile)
-
-    # 兜底抽取：用户回答当前被问字段，但关键词没抽到 → 尽力识别，保证进度前进
+    # ---- 抽取：LLM 优先理解（有 key），规则兜底（无 key / LLM 失败）----
+    extracted = {}
+    # ① LLM 理解：模型从自然语言抽取任意字段（行业/地区/注册类型等，不穷举）
+    llm_ext = llm_extract_profile(user_text, profile)
+    if llm_ext:
+        extracted.update(llm_ext)
+    # ② 规则兜底：LLM 没抽到的字段用关键词/数字规则补充（保证无 key 也能跑）
+    rule_ext = bp.extract_from_text(user_text, profile)
+    for k, v in rule_ext.items():
+        if v and k not in extracted:
+            extracted[k] = v
+    # ③ 追问兜底：用户回答当前被问字段但都没抽到 → 尽力识别，保证进度前进
     missing = bp.missing_fields(profile)
     if missing and missing[0]["key"] not in extracted and not profile.get(missing[0]["key"]):
         q_key = missing[0]["key"]
@@ -688,8 +716,7 @@ def process_chat(user_text: str, profile: dict, chat: list, region: str):
             if v:
                 extracted[q_key] = v
         else:
-            # 自由文本字段（region/reg_type/education/industry…）：
-            # 仅当回答简短、非跑题、且没提供其他字段信息时，直接记录原文，保证不卡死。
+            # 自由文本字段：仅当回答简短、非跑题、且没提供其他字段信息时，直接记录原文
             other_fields = [k for k in extracted if k != q_key]
             if len(user_text) <= 40 and not _looks_like_off_topic(user_text) and not other_fields:
                 extracted[q_key] = user_text
