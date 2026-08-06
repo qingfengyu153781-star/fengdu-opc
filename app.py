@@ -611,7 +611,13 @@ def render_report(profile: dict, summ: dict, indices: dict, title: str = "预审
     pending = [m for m in summ["checklist"] if m["status"] == "待确认"]
     if missing or pending:
         # 修复（S4）：缺失与待确认都需提示，不能只统计"缺失"——否则用户未确认材料时会误报"材料完整"
-        lines.append(f"\n⚠️ **建议准备/确认材料**（缺 {len(missing)} 项 · 待确认 {len(pending)} 项）：")
+        _m, _p = len(missing), len(pending)
+        if _m and _p:
+            lines.append(f"\n⚠️ **建议准备/确认材料**（{_m} 项缺失 · {_p} 项待确认）：")
+        elif _m:
+            lines.append(f"\n⚠️ **建议优先准备材料**（缺 {_m} 项）：")
+        else:
+            lines.append(f"\n⚠️ **请确认以下材料是否已备**（{_p} 项待确认）：")
         for m in (missing + pending)[:5]:
             if m["status"] == "缺失":
                 lines.append(f"- {m['name']}" + (f"（{m['format_note']}）" if m.get("format_note") else ""))
@@ -731,7 +737,11 @@ def process_chat(user_text: str, profile: dict, chat: list, region: str):
     missing = bp.pending_ask(profile)
     if missing and missing[0]["key"] not in extracted and not profile.get(missing[0]["key"]):
         q_key = missing[0]["key"]
-        if q_key in ("social_security", "corp_account", "biz_scope_ai"):
+        if extracted:
+            # 本轮已识别到其他字段（如客户集中度/现金流），说明用户在补充信息而非回答当前问题
+            # → 不做宽松数字兜底，防止把"单客户60%"的 60 误塞进 team_size（团队规模=60 bug）
+            pass
+        elif q_key in ("social_security", "corp_account", "biz_scope_ai"):
             v = bp.parse_yes_no(user_text)
             if v:
                 extracted[q_key] = v
@@ -742,7 +752,12 @@ def process_chat(user_text: str, profile: dict, chat: list, region: str):
         else:
             # 自由文本字段：仅当回答简短、非跑题、且没提供其他字段信息时，直接记录原文
             other_fields = [k for k in extracted if k != q_key]
-            if len(user_text) <= 40 and not _looks_like_off_topic(user_text) and not other_fields:
+            if q_key == "region":
+                # region 只接受纯地名短回答（如"重庆""广州"），拒绝"客户比较分散"这类非地名
+                # ——否则会把无关回答当地区，导致整个政策路由错误
+                if re.match(r"^[一-龥]{2,4}$", user_text) and not _looks_like_off_topic(user_text):
+                    extracted[q_key] = user_text
+            elif len(user_text) <= 40 and not _looks_like_off_topic(user_text) and not other_fields:
                 extracted[q_key] = user_text
 
     new_keys = [k for k, v in extracted.items() if v and not profile.get(k)]
