@@ -120,6 +120,38 @@ _SPECIAL_PARSERS = {
     ],
 }
 
+
+def extract_industry_free(text: str) -> str:
+    """行业自由文本识别（纯模式，零穷举）。
+
+    卖点哲学同搜索：不预置任何行业表，用户说什么行业就识别什么。
+    只靠模式"我(做|从事|搞|是|干|开|经营)XXX"，把 XXX 原文提取为行业。
+    任何行业（金融/教培/宠物殡葬/元宇宙…）都能识别，无一例外。
+    """
+    t = (text or "").strip()
+    if not t:
+        return ""
+    import re
+    # 模式1：我(做|从事|搞|干|开|经营|主做|主营)XXX —— 动词后接行业
+    # 注意：不用"是"当动词（太泛，会误抓"是做教培"的"做"）；非贪婪但至少抓 2 字
+    m = re.search(r"(?:我|本人)?(?:做|从事|搞|干|开|经营|主做|主营)([一-龥]{2,8})", t)
+    if m:
+        ind = m.group(1).strip()
+        # 去掉"的/了/行业/公司"等词尾
+        ind = re.sub(r"(的|了|行业|类|方面|生意|公司|个体户|工作|项目|这一行)$", "", ind)
+        if ind and len(ind) >= 2:
+            return ind
+    # 模式2：我是做XXX / 我是搞XXX（"做/搞"在"是"后，单独匹配）
+    m2 = re.search(r"是(做|搞|从事|干)([一-龥]{2,8})", t)
+    if m2:
+        return m2.group(2).strip()
+    # 模式3：主营/从事/做 XXX 行业
+    m3 = re.search(r"(?:从事|主营|做|搞)([一-龥]{2,8})行业", t)
+    if m3:
+        return m3.group(1).strip()
+    return ""
+
+
 _CN_DIGITS = {"一": 1, "二": 2, "两": 2, "三": 3, "四": 4, "五": 5, "六": 6, "七": 7, "八": 8, "九": 9}
 
 
@@ -223,6 +255,11 @@ def extract_field_value(text: str, key: str) -> str:
             m = re.search(pattern, text, re.IGNORECASE)
             if m:
                 return fn(m)
+    # 行业自由文本（纯模式，零穷举）：关键词没抽到 → 用"我做XXX"模式识别任意行业
+    if key == "industry":
+        v = extract_industry_free(text)
+        if v:
+            return v
     return ""
 
 

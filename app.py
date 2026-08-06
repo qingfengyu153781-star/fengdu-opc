@@ -44,8 +44,9 @@ def _asset_b64(filename: str) -> str:
 
 LOGO_B64 = _asset_b64("logo.webp") or _asset_b64("logo.png")
 BANNER_B64 = _asset_b64("banner.webp") or _asset_b64("banner.png")
-# bg.png 1.66MB 仅作全页背景 → 删除，用 CSS 纯色 BG 替代（视觉一致，省 1.66MB）
-BG_B64 = ""
+# 全页背景图：bg.webp（18KB 压缩版，视觉同原图，省 1.7MB）
+# 主版显示背景图；高对比版（投影）用 CSS 隐藏 → 纯白高可读
+BG_B64 = _asset_b64("bg.webp") or _asset_b64("bg.png")
 # 地区横幅用压缩版（2KB，可安全放进 CSS background）
 REGION_BANNER_B64 = _asset_b64("region_banner_small.webp") or _asset_b64("region_banner.png")
 
@@ -76,46 +77,75 @@ HC_PANEL = "#F5F5F5"         # 浅灰面板（组件底，对比清晰）
 HC_BORDER = "#888888"        # 中等灰边框
 HC_RED = "#CC0000"          # 风险红
 
-HC_CSS = f"""
-:root {{ --hc-bg: {HC_BG}; --hc-text: {HC_TEXT}; --hc-accent: {HC_ACCENT}; }}
-html {{ background: #ffffff !important; }}
-body {{ background: #ffffff !important; color: #000000 !important;
-  font-family: "Microsoft YaHei", sans-serif; }}
-gradio-app, .gradio-app, .gradio-container {{ background: #ffffff !important; max-width: 100% !important; }}
-#full-bg {{ display: none !important; }}   /* 隐藏背景图，纯白更清晰 */
-#brand-bar {{ background: #0052CC !important; color: #fff !important; }}
+# 高对比颜色覆盖块（叠加在完整主版 CSS 之后 → 布局与主版一致，只换色）
+HC_OVERLAY = """
+/* ===== 高对比投影版：纯白底 + 纯黑字 + 蓝强调（叠加在主版 CSS 后）===== */
+html { background: #ffffff !important; }
+body { background: #ffffff !important; color: #000000 !important; }
+gradio-app, .gradio-app, .gradio-container { background: #ffffff !important; }
+#full-bg { display: none !important; }   /* 隐藏背景图，纯白更清晰 */
+#brand-bar, #brand-bar.brand-bar-gradient { background: #0052CC !important; }
+.brand-content { background: #0052CC !important; color: #ffffff !important; }
+.brand-title, .brand-sub, .brand-content * { color: #ffffff !important; }
+.brand-banner-img { opacity: 0.2 !important; }
+/* 地区标签：纯蓝底白字（原白字白底看不清） */
+.region-pill { background: #0d47a1 !important; color: #ffffff !important;
+  border: 1px solid #ffffff !important; }
 .gradio-container label, .gradio-container .block, .gradio-container .form,
 .gradio-container textarea, .gradio-container input[type="text"],
-.gradio-container select {{ background: #ffffff !important; color: #000000 !important;
-  border: 2px solid #444444 !important; border-radius: 8px !important; }}
-.gradio-container [role="tab"] {{ color: #000000 !important; font-weight: 700 !important; }}
-.gradio-container [role="tab"].selected {{ background: #0052CC !important; color: #ffffff !important; }}
-.gradio-container .tabitem {{ background: #ffffff !important; border: 2px solid #aaaaaa !important; }}
+.gradio-container select { background: #ffffff !important; color: #000000 !important;
+  border: 2px solid #444444 !important; }
+.gradio-container textarea::placeholder, .gradio-container input::placeholder { color: #555555 !important; }
+.gradio-container [role="tab"] { color: #000000 !important; font-weight: 700 !important; }
+.gradio-container [role="tab"].selected { background: #0052CC !important; color: #ffffff !important; }
+.gradio-container .tabitem { background: #ffffff !important; border: 2px solid #aaaaaa !important; }
 .gradio-container .prose, .gradio-container .markdown,
-.gradio-container .prose :is(p, h1, h2, h3, h4, ul, ol, li, strong, em, span, blockquote, code) {{
-  color: #000000 !important; }}
+.gradio-container .prose :is(p, h1, h2, h3, h4, ul, ol, li, strong, em, span, blockquote, code) {
+  color: #000000 !important; }
+.wrapper:has(.bubble-wrap) { background: #f0f0f0 !important; }
+.bubble-wrap { background: #f0f0f0 !important; }
+.bubble-wrap *, .message-row *, .bot.message *, .user.message *,
+.message, .message *, .bot .message, .user .message { color: #000000 !important; }
 .message-row.bubble.bot-row .bot.message,
-.message-row.bubble.user-row .user.message {{ background: #f5f5f5 !important; color: #000000 !important;
-  border: 2px solid #666666 !important; }}
-/* 驾驶舱：白底黑字高对比 */
-.cockpit {{ background: #ffffff !important; color: #000000 !important; border: 3px solid #000000 !important; }}
-.cockpit-head {{ color: #0052CC !important; border-bottom: 2px solid #000000 !important; }}
-.metric .big {{ color: #000000 !important; font-weight: 800 !important; }}
-.gold {{ color: #0052CC !important; }}
-.risk-low {{ color: #006600 !important; }} .risk-mid {{ color: #B26A00 !important; }} .risk-high {{ color: #CC0000 !important; }}
-#maple-btn {{ background: #0052CC !important; color: #fff !important; font-weight: 700 !important; }}
-#reset-btn {{ background: #666666 !important; color: #fff !important; }}
-#prefill-btn {{ background: #0052CC !important; color: #fff !important; }}
-.gradio-container .prose a {{ color: #0052CC !important; font-weight: 700 !important; }}
-.bar {{ background: #e0e0e0 !important; }}
-.bar-fill {{ background: #0052CC !important; color: #fff !important; }}
+.message-row.bubble.user-row .user.message { background: #f5f5f5 !important; color: #000000 !important;
+  border: 2px solid #666666 !important; }
+.gradio-container .prose blockquote { background: #f0f0f0 !important; color: #000000 !important;
+  border-left: 4px solid #0052CC !important; }
+.wrapper:has(.bubble-wrap) .icon-button-wrapper,
+.wrapper:has(.bubble-wrap) .icon-button { background: #e8e8e8 !important; }
+.wrapper:has(.bubble-wrap) .icon-button,
+.wrapper:has(.bubble-wrap) .icon-button *,
+.wrapper:has(.bubble-wrap) .icon-button svg,
+.wrapper:has(.bubble-wrap) .icon-button svg * { color: #000000 !important; fill: #000000 !important; }
+.wrapper:has(.bubble-wrap) .icon-button { --bg-color: #e8e8e8 !important; }
+.wrapper:has(.bubble-wrap) label { color: #000000 !important; }
+/* 合规横幅：深蓝底白字（原浅粉红字对比弱，覆盖 inline style） */
+.hc-banner { background: #0d47a1 !important; border-color: #0d47a1 !important; color: #ffffff !important; }
+.hc-banner * { color: #ffffff !important; }
+.cockpit { background: #ffffff !important; color: #000000 !important; border: 3px solid #000000 !important; }
+.cockpit * { color: #000000 !important; }
+.cockpit-head { color: #0052CC !important; border-bottom: 2px solid #000000 !important; }
+.cockpit-head, .cockpit .metric-label, .cockpit .progress, .cockpit .section-title,
+.cockpit .material, .cockpit .cockpit-footer, .cockpit .metric .lab { color: #000000 !important; }
+.cockpit .metric .big { color: #000000 !important; }
+.cockpit .gold { color: #0052CC !important; }
+.cockpit .bar { background: #e0e0e0 !important; }
+.cockpit .bar-fill { background: #b0b0b0 !important; color: #000000 !important; }
+.metric .big { color: #000000 !important; font-weight: 800 !important; }
+.gold { color: #0052CC !important; }
+.risk-low { color: #006600 !important; } .risk-mid { color: #B26A00 !important; } .risk-high { color: #CC0000 !important; }
+#maple-btn { background: #0052CC !important; color: #fff !important; font-weight: 700 !important; }
+#reset-btn { background: #333333 !important; color: #ffffff !important; border: 1px solid #ffffff !important; }
+#prefill-btn { background: #0052CC !important; color: #fff !important; }
+.gradio-container .prose a { color: #0052CC !important; font-weight: 700 !important; }
+.bar { background: #e0e0e0 !important; }
+.bar-fill { background: #0052CC !important; color: #fff !important; }
+.region-dd { background-image: none !important; background: #ffffff !important; }
+.region-dd .wrap, .region-dd .wrap-inner, .region-dd .secondary-wrap { background: #ffffff !important; }
+.gradio-container option { background: #ffffff !important; color: #000000 !important; }
 .gradio-container footer, .gradio-container > footer,
-footer[aria-label="Gradio footer navigation"] {{ display: none !important; }}
+footer[aria-label="Gradio footer navigation"] { display: none !important; }
 """
-
-# 主题选择：UI_THEME=high_contrast → 高对比投影版；否则默认暖橙主版
-import os as _os
-USE_HC = _os.getenv("UI_THEME", "") == "high_contrast"
 
 # ---------------------------------------------------------------- CSS（浅暖橙红系）
 # 全页背景改为纯色（bg 图由 HTML img 层负责，避免 CSS base64 膨胀）
@@ -440,6 +470,13 @@ footer[aria-label="Gradio footer navigation"] {{
   display: none !important;
 }}
 """
+
+# ---------------------------------------------------------------- 主题选择
+# UI_THEME=high_contrast → 高对比投影版（主版完整布局 + 纯白黑字蓝覆盖）
+# 否则默认暖橙主版。两个主题共用同一份布局 CSS，高对比只叠加颜色覆盖 → 布局不崩。
+import os as _os
+USE_HC = _os.getenv("UI_THEME", "") == "high_contrast"
+HC_CSS = CSS + HC_OVERLAY
 
 
 # ---------------------------------------------------------------- 驾驶舱渲染
@@ -1201,7 +1238,7 @@ def build_ui():
 
         # 合规边界显性横幅（首屏可见，符合"辅助不替代"赛制要求）
         gr.HTML("""
-        <div style="background:#FDE8E8;border:1px solid #E5484D;color:#C0392B;
+        <div class="hc-banner" style="background:#FDE8E8;border:1px solid #E5484D;color:#C0392B;
                     border-radius:10px;padding:10px 14px;margin-bottom:12px;font-size:13px;line-height:1.6;">
           🛡️ 本系统仅为<b>辅助经营顾问</b>，所有政策匹配与风险诊断结果<b>仅供参考</b>，
           不替代政府机构、金融机构或律师的最终专业判断。重大决策请咨询本地官方窗口。
@@ -1362,5 +1399,7 @@ if __name__ == "__main__":
         active_css, hue = CSS, "orange"
     theme = gr.themes.Base(primary_hue=hue, neutral_hue="stone",
                            font=["Microsoft YaHei", "sans-serif"])
-    demo.launch(server_name="0.0.0.0", server_port=7860, show_error=True,
+    # 端口：GRADIO_SERVER_PORT 优先（便于多实例/测试），默认 7860
+    port = int(_os.getenv("GRADIO_SERVER_PORT", "7860"))
+    demo.launch(server_name="0.0.0.0", server_port=port, show_error=True,
                 css=active_css, theme=theme)
