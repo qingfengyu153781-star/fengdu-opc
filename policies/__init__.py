@@ -1,17 +1,18 @@
 # -*- coding: utf-8 -*-
 """地区注册表：地区代码 → 政策库模块。
 
-设计原则：**不预置一堆城市**。只有演示用的温州/杭州有真实数据，
+设计原则：**不预置一堆城市**。温州是已人工核实的真实库；杭州暂无预收录
+（2026-08-07 清空占位）→ 切换杭州自动走实时搜索 + 通用方向兜底。
 用户输入任意其他地区 → 实时联网搜索当地政策（见 utils/policy_searcher.py），
 并叠加通用政策方向库兜底（见 policies/general.py）。
 
-任何地区政策库 = 国家级通用(national) + 该地区自己的政策。
+任何地区政策库 = 国家级通用(national) + 该地区自己的政策（空库地区回退 general）。
 """
 
 from . import national, wenzhou, hangzhou, general
 
 # 地区注册表：地区 code → 模块
-# 只有演示用真实库（温州/杭州）。用户输入的其他地区 → 实时搜索 + 通用方向。
+# 温州为已核实真实库；杭州无预收录（实时搜索兜底）；其他地区 → 实时搜索 + 通用方向。
 REGIONS = {
     "wenzhou": wenzhou,
     "hangzhou": hangzhou,
@@ -37,9 +38,11 @@ def all_policies(region_code: str) -> list[dict]:
     """地区全部政策 = national + 该地区政策（national 永远第一优先级）。
 
     未收录地区 → national + general（通用政策方向，标注「通用参考·需核验」）。
+    已收录但 POLICIES 为空（如清空占位后的杭州）→ 同样走 general 兜底，
+    保证该地区不因空库而匹配 0 项（2026-08-07 修复空壳占位）。
     """
     region_mod = REGIONS.get(region_code)
-    if region_mod is None:
+    if region_mod is None or not region_mod.POLICIES:
         return list(national.POLICIES) + list(FALLBACK_REGION.POLICIES)
     return list(national.POLICIES) + list(region_mod.POLICIES)
 

@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import re
 
+from utils import rule_engine
 from utils.rule_engine import matched_policies, assess_risk, policy_match_rate
 
 
@@ -125,8 +126,9 @@ def _score_cash_safety(profile: dict) -> tuple[int, str]:
 def _score_cost_control(profile: dict) -> tuple[int, str]:
     cost = profile.get("cost")
     rev = profile.get("revenue")
-    cn = _num(cost)
-    rn = _num(rev)
+    # 成本/营收统一折成万元口径再比，避免 cost='8000元'、rev='3万' 时 8000/3=2666 的假比值（F11）
+    cn = rule_engine._revenue_wan(cost) if cost else None
+    rn = rule_engine._revenue_wan(rev) if rev else None
     if cn is None or rn is None or rn <= 0:
         return 70, "成本/营收比未知（按中性偏乐观计）"
     ratio = cn / rn

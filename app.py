@@ -139,6 +139,10 @@ gradio-app, .gradio-app, .gradio-container { background: #ffffff !important; }
 #reset-btn { background: #333333 !important; color: #ffffff !important; border: 1px solid #ffffff !important; }
 #prefill-btn { background: #0052CC !important; color: #fff !important; }
 .gradio-container .prose a { color: #0052CC !important; font-weight: 700 !important; }
+.gradio-container table, .gradio-container table th, .gradio-container table td {
+  background: #ffffff !important; color: #000000 !important;
+  border: 1px solid #444444 !important; }
+.gradio-container table th { background: #f0f0f0 !important; color: #000000 !important; }
 .bar { background: #e0e0e0 !important; }
 .bar-fill { background: #0052CC !important; color: #fff !important; }
 .region-dd { background-image: none !important; background: #ffffff !important; }
@@ -366,6 +370,38 @@ gradio-app, .gradio-app {{
   padding: 10px 14px !important;
 }}
 
+/* ---- Markdown 表格（地区对比等）：Gradio 深色模式默认白底白字，覆盖成暖色主题 ---- */
+.gradio-container table,
+.gradio-container .prose table,
+.gradio-container .markdown table,
+.gradio-container table.markdown-table {{
+  background: {PANEL} !important;
+  color: {TEXT} !important;
+  border-collapse: collapse !important;
+  border-radius: 8px !important;
+  overflow: hidden !important;
+  margin: 6px 0 10px !important;
+}}
+.gradio-container table th,
+.gradio-container table td {{
+  background: transparent !important;
+  color: {TEXT} !important;
+  border: 1px solid {COCKPIT_BORDER} !important;
+  padding: 8px 12px !important;
+  text-align: left !important;
+  font-size: 13px !important;
+  line-height: 1.5 !important;
+}}
+.gradio-container table th {{
+  background: {BG_DEEP} !important;
+  color: {MAPLE_RED} !important;
+  font-weight: 700 !important;
+  white-space: nowrap !important;
+}}
+.gradio-container table tr:nth-child(even) td {{
+  background: {BG_DEEP} !important;
+}}
+
 /* ---- 地区选择器横幅背景 ---- */
 /* 地区选择器：压缩横幅背景 + 无边框 + 清晰文字 */
 /* gradio .block 边框由 CSS 变量控制 → 用变量归零最有效 */
@@ -470,6 +506,29 @@ gradio-app, .gradio-app {{
 footer[aria-label="Gradio footer navigation"] {{
   display: none !important;
 }}
+
+/* 2026-08-07 深色模式可读性修复：gr.HTML 内 <b> 与 Accordion 标题在 gradio 深色主题下默认白字，看不清 */
+/* 合规边界横幅：强制浅粉底深红字（覆盖 gradio 深色模式把 <b> 变白的问题） */
+.hc-banner {{ background: #FDE8E8 !important; border: 1px solid #E5484D !important; color: #C0392B !important; }}
+.hc-banner * {{ color: #C0392B !important; }}
+/* 三指数说明 Accordion 标题：默认黑字可读（覆盖 gradio 深色模式白字，gradio6 实际结构=button.label-wrap 内 span） */
+.gradio-container button.label-wrap,
+.gradio-container button.label-wrap * {{
+  color: #000000 !important;
+}}
+.gradio-container details summary,
+.gradio-container details summary *,
+.gradio-container .accordion-heading,
+.gradio-container .accordion-heading * {{
+  color: #000000 !important;
+}}
+
+/* 隐藏 Chatbot 组件顶部的标题框（Tab1「对话」/ Tab3 默认「Chatbot」）。
+   gradio6 Chatbot 的 block 内含独有元素 div[data-testid="status-tracker"]，
+   用 :has() 精确匹配该 block 内的 label[data-testid="block-label"]（只隐藏 Chatbot，不动 Textbox） */
+.block:has(> [data-testid="status-tracker"]) > .wrapper > label[data-testid="block-label"] {{
+  display: none !important;
+}}
 """
 
 # ---------------------------------------------------------------- 主题选择
@@ -522,10 +581,14 @@ def render_cockpit(profile: dict, region: str, indices: dict | None = None,
 
     mat_html = ""
     for m in (missing + pending)[:6]:
+        # F19（2026-08-07）：缺失材料加"去哪办"来源机构提示（从政策 source 提取）
+        where = m.get("source", "") or ""
+        where_html = (f' <span style="font-size:10.5px;color:#E3C9B0;">→ {where[:18]}</span>'
+                      if where and len(where) < 24 else "")
         if m["status"] == "缺失":
-            mat_html += f'<div class="material"><span class="warn">⚠️ {m["name"]}</span></div>'
+            mat_html += f'<div class="material"><span class="warn">⚠️ {m["name"]}</span>{where_html}</div>'
         else:
-            mat_html += f'<div class="material"><span class="warn">⏳ {m["name"]}</span></div>'
+            mat_html += f'<div class="material"><span class="warn">⏳ {m["name"]}</span>{where_html}</div>'
     shown = len((missing + pending)[:6])
     total = len(checklist)
     if auto:
@@ -649,9 +712,57 @@ def _region_code(name_or_code: str) -> str:
     return _REGION_CODE_BY_LABEL.get(name_or_code, name_or_code)
 
 
+def _region_display(code_or_name: str) -> str:
+    """code→展示名（'wenzhou'→'温州'）；已是中文则原样（供输入框回显，2026-08-07 UI 调整）。"""
+    return REGION_LABELS.get(code_or_name, code_or_name)
+
+
 def _looks_like_off_topic(text: str) -> bool:
     """判断回答是否明显跑题（跳过/不知道），此时不应把原文硬塞进字段。"""
     return any(k in text for k in ("不知道", "不清楚", "跳过", "下一个", "随便", "换一个"))
+
+
+def _looks_like_garbage(text: str) -> bool:
+    """判断输入是否是无意义/乱码（胡言乱语防护，F17 修复）。
+
+    用户可能输入乱码/无意义句子，系统不应把"奘馕肏犇""今天天气好"当成
+    注册类型/地区等真实字段记录（会污染 profile，导致政策路由错误）。
+    检测特征：
+      - 3+ 连续相同字符（"啊啊啊啊""111111"）
+      - 纯标点/emoji/符号
+      - 生僻字（GBK 罕见/非常用字，如 奘馕肏犇 这类在正常经营表达中不出现）
+      - 常见城市/行业/经营词的"表意密度"过低
+    """
+    t = (text or "").strip()
+    if not t:
+        return True
+    # 连续重复字符（3+）
+    if re.search(r"(.)\1{2,}", t):
+        return True
+    # 纯标点/符号/emoji（无汉字无字母数字）
+    if not re.search(r"[一-鿿0-9A-Za-z]", t):
+        return True
+    # 生僻字检测：乱码多是 GBK 二级字/非常用字（如 奘/馕/犇），正常经营表达（摄影/青岛/餐饮）全是一级常用字。
+    # 用 GBK 编码级别判定：一级字（0xB0A1-0xD7F9，现代汉语常用字表 3755 字）视为正常，
+    # 含二级字/无法 GBK 编码的字 → 乱码。精准区分"奘馕肏犇"(乱码) vs "青岛/摄影"(正常)。
+    hanzi = re.findall(r"[一-鿿]", t)
+    if len(hanzi) >= 2:
+        rare = [ch for ch in hanzi if not _is_gbk_common(ch)]
+        if len(rare) >= max(1, len(hanzi) // 2):
+            return True
+    return False
+
+
+def _is_gbk_common(ch: str) -> bool:
+    """判断汉字是否为 GBK 一级常用字（现代汉语常用字表前 3755 字）。"""
+    try:
+        b = ch.encode("gbk")
+        if len(b) == 1:
+            return True  # ASCII
+        hi = b[0]
+        return 0xB0 <= hi <= 0xD7  # GBK 一级区
+    except Exception:
+        return False  # 无法 GBK 编码（更生僻）
 
 
 # ---------------------------------------------------------------- 涉法红线拦截（合规硬约束）
@@ -712,14 +823,14 @@ def process_chat(user_text: str, profile: dict, chat: list, region: str):
     chat = chat or []
     user_text = (user_text or "").strip()
     if not user_text:
-        return "", profile, region, chat, render_cockpit(profile, region, partial=True), ""
+        return "", profile, _region_display(region), chat, render_cockpit(profile, region, partial=True), ""
     chat.append({"role": "user", "content": user_text})
 
     # 涉法红线拦截：命中立即拒绝，绝不带进匹配流程（合规硬约束）
     if _has_redline(user_text):
         chat.append({"role": "assistant", "content": _REDLINE_REPLY})
         region_out = _region_code(profile.get("region") or region)
-        return ("", profile, region_out, chat,
+        return ("", profile, _region_display(region_out), chat,
                 render_cockpit(profile, region_out, partial=True), "⛔ 已拦截")
 
     # ---- 抽取：LLM 优先理解（有 key），规则兜底（无 key / LLM 失败）----
@@ -750,15 +861,31 @@ def process_chat(user_text: str, profile: dict, chat: list, region: str):
             if v:
                 extracted[q_key] = v
         else:
-            # 自由文本字段：仅当回答简短、非跑题、且没提供其他字段信息时，直接记录原文
+            # 自由文本字段：仅当回答简短、非跑题、非垃圾、且没提供其他字段信息时，直接记录原文
             other_fields = [k for k in extracted if k != q_key]
             if q_key == "region":
                 # region 只接受纯地名短回答（如"重庆""广州"），拒绝"客户比较分散"这类非地名
-                # ——否则会把无关回答当地区，导致整个政策路由错误
-                if re.match(r"^[一-龥]{2,4}$", user_text) and not _looks_like_off_topic(user_text):
+                # 和乱码（"奘馕肏犇"也是 2-4 汉字，需垃圾检测）——否则会把无关回答当地区，导致政策路由错误
+                if (re.match(r"^[一-龥]{2,4}$", user_text)
+                        and not _looks_like_off_topic(user_text)
+                        and not _looks_like_garbage(user_text)):
                     extracted[q_key] = user_text
-            elif len(user_text) <= 40 and not _looks_like_off_topic(user_text) and not other_fields:
-                extracted[q_key] = user_text
+            elif (len(user_text) <= 40
+                  and not _looks_like_off_topic(user_text)
+                  and not _looks_like_garbage(user_text)
+                  and not other_fields):
+                # 封闭选项字段（reg_type/social_security/education/biz_scope_ai/corp_account）不直录任意文本——
+                # 只接受用户回答"选项"里的值或数字字段的自然值；乱码/无意义句子不记录（F17 修复）
+                if q_key in ("reg_type", "social_security", "education", "biz_scope_ai", "corp_account"):
+                    fdef = next((f for f in bp.FIELDS if f["key"] == q_key), None)
+                    opts = fdef.get("options", []) if fdef else []
+                    # 封闭选项：只有回答与某个选项部分匹配才记录；否则视为无效回答（不塞垃圾）
+                    if not opts or not any(o in user_text for o in opts):
+                        pass
+                    else:
+                        extracted[q_key] = user_text
+                else:
+                    extracted[q_key] = user_text
 
     new_keys = [k for k, v in extracted.items() if v and not profile.get(k)]
     profile.update(extracted)
@@ -822,7 +949,7 @@ def process_chat(user_text: str, profile: dict, chat: list, region: str):
         filled = sum(1 for k, v in profile.items()
                      if not k.startswith("_") and v not in (None, "", [], {}))
         status = f"⏳ 已收集 {filled}/{len(bp.FIELD_KEYS)} 项 · 回答上方的 AI 问题继续"
-        return "", profile, region_out, chat, cockpit, status
+        return "", profile, _region_display(region_out), chat, cockpit, status
 
     # 完整 → 匹配 + 诊断（一律用 region code 匹配政策库，profile['region'] 仅中文展示用）
     summ = summary(profile, region_out)
@@ -852,7 +979,7 @@ def process_chat(user_text: str, profile: dict, chat: list, region: str):
     chat.append({"role": "assistant", "content": report})
     cockpit = render_cockpit(profile, region_out, indices, summ, partial=False)
     status = "✅ 预审完成 · 可切换地区或修改信息重新诊断"
-    return "", profile, region_out, chat, cockpit, status
+    return "", profile, _region_display(region_out), chat, cockpit, status
 
 
 def bp_summarize_key(k: str, v: str) -> str:
@@ -916,12 +1043,41 @@ def run_diagnosis(profile_inputs: dict, region: str):
 
 # ---------------------------------------------------------------- 合规问答
 COMPLIANCE_MOCK = {
-    "小微": "小型微利企业年应纳税所得额不超过 300 万元，实际税负约 5%，季度申报时系统自动享受，无需单独备案。辅助参考，以税务部门最新口径为准。",
+    # 注意 dict 遍历顺序 = 命中顺序：长的/具体的关键词放前面，避免被短词抢答
+    "月销售额": "月销售额 10 万以下（按季 30 万）的小规模纳税人免征增值税，申报时系统自动判断。辅助参考，以官方公告为准。",
+    "小型微利": "小型微利企业年应纳税所得额不超过 300 万元，实际税负约 5%，季度申报时系统自动享受，无需单独备案。辅助参考，以税务部门最新口径为准。",
+    "小微企业": "小微企业通常指小型微利企业：年应纳税所得额≤300万、从业人数≤300人、资产总额≤5000万，实际税负约 5%（季度申报自动享受）。辅助参考，以官方口径为准。",
+    "小规模纳税人": "月销售额 10 万以下（按季 30 万）的小规模纳税人免征增值税；年销售额超 500 万自动转为一般纳税人。辅助参考，以税务最新口径为准。",
+    "一般纳税人": "年销售额超 500 万通常需登记一般纳税人；小规模纳税人可自愿转登记，但进项抵扣规则不同，建议先咨询税务。辅助参考。",
     "报税": "一人公司/个体户报税注意：①小规模纳税人月销售额 10 万以下（季度 30 万）免征增值税；②小型微利企业实际税负约 5%；③补贴收入通常不征企业所得税，但以当地税务口径为准；④建议从 Day 1 记清收入/成本/研发支出，避免年底补账。辅助参考，以税务部门最新口径为准。",
-    "增值税": "月销售额 10 万以下（按季 30 万）的小规模纳税人免征增值税，申报时系统自动判断。辅助参考，以官方公告为准。",
+    "增值税": "月销售额 10 万以下（按季 30 万）的小规模纳税人免征增值税；超过则按 1% 或适用税率征收（政策会调整，以当期公告为准）。辅助参考。",
+    "个税": "个体户经营所得按 5%-35% 五级累进；个人独资/合伙企业合伙人同样按经营所得计税。辅助参考，以税务最新口径为准。",
+    "企业所得税": "小微企业实际税负约 5%（年应纳税所得额≤300万）；一般企业 25%。一人有限责任公司独立法人，需缴纳企业所得税。辅助参考。",
+    "发票": "小规模纳税人可自开增值税普通发票；月销售额 10 万以下免征增值税但需如实申报。专票需咨询当地税务能否代开。辅助参考。",
+    "开票": "小规模纳税人可自开增值税普通发票；月销售额 10 万以下免征增值税但需如实申报。专票需咨询当地税务能否代开。辅助参考。",
     "社保": "一人公司/个体户可缴灵活就业社保，多项温州创业补贴要求缴纳社保（如创业带动就业补贴、人才租房补贴），建议尽早开通。辅助参考。",
+    "医保": "灵活就业可缴职工医保或城乡居民医保；职工医保报销比例通常更高、有个人账户。一人生意建议至少配一份医保。辅助参考。",
+    "公积金": "个体户/灵活就业在部分地区可自愿缴存公积金（看当地政策），租房、买房贷款有用。辅助参考，以当地公积金中心为准。",
     "加计": "研发费用可在税前加计扣除，需建立研发费用辅助账。对单人软件公司，大模型 API 费用可计入研发投入。辅助参考，以税务申报要求为准。",
     "双软": "软件企业两免三减半需通过双软认定（软件产品登记 + 软件企业认定），建议找代理机构办理（¥3,000-8,000 一次性）。辅助参考。",
+    "软著": "软件著作权登记约 1-3 个月，费用数百元（可自行通过版权局或代办）。软著是申请双软、高新、部分创业补贴的常见材料。辅助参考。",
+    "合同": "建议用书面合同明确：服务内容/交付物、金额与付款节点、验收标准、知识产权归属、违约责任。一人生意也建议签，保护自己。辅助参考，具体条款咨询律师。",
+    "公司注册": "一人公司注册流程：核名→准备材料→提交登记→领取执照→刻章→银行开户→税务登记。个体户类似但更简。部分地区免费代办。辅助参考。",
+    "营业执照": "营业执照办理：政务服务网/市监部门登记，个体户或一人公司均可。办完需按时年报（每年 6 月底前），逾期进经营异常名录。辅助参考。",
+    "经营异常": "年报逾期或地址失联会进经营异常名录，影响贷款与信誉。发现后尽快补报并向市监申请移出。辅助参考。",
+    "创业贷款": "创业担保贷款各地额度常见 10-30 万、可贴息，需当地人社局推荐+银行审批，一般要求有营业执照、正常经营。辅助参考，以当地政策为准。",
+    "补贴": "常见创业补贴：一次性创业补贴、场地/租金减免、社保补贴、创业带动就业补贴。资格看学历/毕业年限/注册类型/社保，各地不同，以当地人社为准。辅助参考。",
+    "个转企": "个体工商户可转型升级为有限责任公司（个转企），多地有配套补贴或税收延续政策，办理前咨询当地市监。辅助参考。",
+    "账": "一人生意也建议记账：收入/成本/研发/发票分清楚，年底报税和申补贴都要用。可用免费记账软件，或找代账（约 ¥200-500/月）。辅助参考。",
+    "代账": "小微企业代账服务常见 ¥200-500/月，含记账+报税。可节省时间，但务必选有资质机构并核对账目。辅助参考。",
+    "知识产权": "一人公司也建议保护：商标注册（约 ¥300/类/次）、软著登记、专利（视行业）。商标有恶意抢注风险，早注册早安心。辅助参考。",
+    "商标": "商标注册约 ¥300/类（官网申请），注册周期 6-12 个月。建议注册前先查重，避免驳回或侵权。辅助参考。",
+    "灵活就业": "灵活就业人员可缴养老+医疗（本地户籍或居住证），缴费比例低于企业职工。多项补贴需社保，尽早开通。辅助参考，以当地社保局为准。",
+    "劳务": "个人劳务报酬所得按 20%-40% 预扣预缴个税，次年汇算清缴可退税。长期稳定接单可考虑注册个体户/公司节税并合规开票。辅助参考。",
+    "风险": "常见经营风险：社保断缴、客户集中、现金流不足、发票合规、年报逾期。建议定期用「②经营健康诊断」自查三指数。辅助参考。",
+    "查账": "税务机关可能抽查账目，务必保留收入/成本/发票凭证至少 5 年。一人生意也不例外。辅助参考。",
+    "注销": "不再经营需办理注销（税务清税→工商注销），逾期未注销可能进黑名单。建议咨询代办或当地市监。辅助参考。",
+    "年报": "每年 1-6 月需报企业/个体户年报，逾期进经营异常名录。这是最容易忽略的合规项。辅助参考。",
 }
 
 
@@ -935,7 +1091,19 @@ def compliance_chat(message, history):
         return history, ""
 
     # 实时联网搜索（免费，独立于 LLM；失败静默）
-    web_block = policy_searcher.format_web_search(message)
+    # E3 增强：有 key 时先生成精准搜索词再搜（理解任意表达），无 key 用裸问题搜
+    _search_q = message
+    if api_client.is_api_available():
+        try:
+            _sys = ("你是政策检索专家。把用户问题转成 1 条精准的搜索引擎查询词（中文，8-20字），"
+                    "只输出查询词本身，不要解释。")
+            _raw, _ = api_client.generate(_sys, f"问题：{message}", temperature=0.3, max_tokens=60)
+            _q = (_raw or "").strip().split("\n")[0].strip().strip("“”\"'。")
+            if 4 <= len(_q) <= 40:
+                _search_q = _q
+        except Exception:
+            pass  # 生成失败 → 用裸问题搜（不白屏）
+    web_block = policy_searcher.format_web_search(_search_q)
 
     if api_client.is_api_available():
         try:
@@ -965,13 +1133,18 @@ def compliance_chat(message, history):
 
 # ---------------------------------------------------------------- 政策导入
 def import_policy(region: str, policy_text: str):
-    """政策导入：粘贴原文 → LLM 结构化 → 追加到 policies/<region>.py。"""
+    """政策导入：粘贴原文 → LLM 结构化 → 追加到 policies/<region>.py。
+
+    热加载（2026-08-07 修复）：入库成功后返回 (msg, 地区展示名, 地区 code)，
+    顶部地区输入框自动填为入库地区、共享 region_state 同步为 code——本次会话即可用，无需重启。
+    失败路径返回 (msg, None, None)（输入框与地区 state 不变）。
+    """
     policy_text = (policy_text or "").strip()
     if not policy_text:
-        return "请先粘贴政策原文。"
+        return "请先粘贴政策原文。", None, None
     if not _looks_like_policy(policy_text):
         return ("⚠️ **未能识别为政策原文**：请粘贴包含政策名称、金额、资格条件的完整政策文本"
-                "（如政府公告原文）。已拒绝入库，防止错误数据污染政策库。")
+                "（如政府公告原文）。已拒绝入库，防止错误数据污染政策库。"), None, None
     if api_client.is_api_available():
         try:
             sys_p = agent_prompts.POLICY_IMPORT_PROMPT.format(region=region, policy_text=policy_text)
@@ -980,26 +1153,29 @@ def import_policy(region: str, policy_text: str):
             if parsed:
                 n = _write_policies_file(region, parsed)
                 return (f"✅ 已入库 **{n} 条**政策（AI 结构化）\n\n"
-                        f"地区「{region}」政策库已更新，可在驾驶舱下拉选择后重新匹配。\n\n"
-                        f"⚠️ 请人工核对入库内容与原文一致——AI 结构化可能出错，以官方文件为准。")
+                        f"地区「{region}」政策库已更新，**本次会话即可用**（已切到「{region}」，无需重启）。\n\n"
+                        f"⚠️ 请人工核对入库内容与原文一致——AI 结构化可能出错，以官方文件为准。\n\n"
+                        f"💡 更多该地区政策可用 **⑤ 政策动态** 实时搜索 → 一键入库。"), region, _slug(region)
             # AI 失败 → 回退规则解析
             parsed = _parse_policy_rules(policy_text)
             if parsed:
                 n = _write_policies_file(region, parsed)
                 return (f"✅ 已入库 **{n} 条**政策（规则解析）\n\n"
-                        f"地区「{region}」政策库已更新。\n\n"
-                        f"⚠️ 规则解析识别有限，请人工核对入库内容与官方原文一致。")
-            return "⚠️ 无法解析政策结构，请检查原文格式或稍后重试。"
+                        f"地区「{region}」政策库已更新，**本次会话即可用**。\n\n"
+                        f"⚠️ 规则解析识别有限，请人工核对入库内容与官方原文一致。\n\n"
+                        f"💡 更多该地区政策可用 **⑤ 政策动态** 实时搜索 → 一键入库。"), region, _slug(region)
+            return "⚠️ 无法解析政策结构，请检查原文格式或稍后重试。", None, None
         except Exception as e:
-            return f"⚠️ 导入失败：{e}，请稍后重试。"
+            return f"⚠️ 导入失败：{e}，请稍后重试。", None, None
     # 离线 → 规则解析（零 LLM 依赖也能导入）
     parsed = _parse_policy_rules(policy_text)
     if parsed:
         n = _write_policies_file(region, parsed)
         return (f"✅ 已入库 **{n} 条**政策（离线规则解析）\n\n"
-                f"地区「{region}」政策库已更新，可在驾驶舱下拉选择后重新匹配。\n\n"
-                f"⚠️ 规则解析识别有限，请人工核对入库内容与官方原文一致。")
-    return "⚠️ 未能识别政策结构，请检查原文格式后重试。"
+                f"地区「{region}」政策库已更新，**本次会话即可用**（已切到「{region}」，无需重启）。\n\n"
+                f"⚠️ 规则解析识别有限，请人工核对入库内容与官方原文一致。\n\n"
+                f"💡 更多该地区政策可用 **⑤ 政策动态** 实时搜索 → 一键入库。"), region, _slug(region)
+    return "⚠️ 未能识别政策结构，请检查原文格式后重试。", None, None
 
 
 def _parse_import_json(raw: str) -> list[dict]:
@@ -1279,7 +1455,25 @@ def _slug(name: str) -> str:
 
 
 def _register_region(code: str, name: str):
-    """把新地区注册进 policies/__init__.py 的 REGIONS + REGION_LABELS。"""
+    """把新地区注册进运行中的 REGIONS + REGION_LABELS（内存热加载，免重启即用），
+    并持久化进 policies/__init__.py（重启后仍生效）。
+
+    2026-08-07 热加载修复：此前导入政策后必须重启服务下拉才出现新地区——
+    现在写完 policies/<code>.py 后立即 reload 模块 + 更新内存 REGIONS/REGION_LABELS，
+    import_policy 同步返回新下拉选项，本次会话即可切换使用。
+    """
+    import importlib
+    # ① 内存热注册：reload 该地区模块（首次导入后 reload 一次拿到最新内容），
+    #    更新 policies 模块的 REGIONS / REGION_LABELS（app 层引用的是同一 dict 对象，自动同步）
+    try:
+        mod = importlib.import_module(f"policies.{code}")
+        importlib.reload(mod)
+        import policies
+        policies.REGIONS[code] = mod
+        policies.REGION_LABELS[code] = name
+    except Exception:
+        pass  # 内存注册失败不阻塞文件持久化（重启后仍生效）
+    # ② 持久化注册（重启后仍生效）
     import os
     path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "policies", "__init__.py")
     with open(path, "r", encoding="utf-8") as f:
@@ -1302,11 +1496,200 @@ def _register_region(code: str, name: str):
         f.write(src)
 
 
+# ---------------------------------------------------------------- Tab⑤ 政策动态 · 地区对比（F18，2026-08-07）
+# 哲学：政策内容全部靠模型实时搜索发现（零预置库），用户可自定义搜索词。
+_PHOTOGRAPHER_PROFILE = {
+    "reg_type": "个体工商户", "industry": "摄影", "duration": "2年", "revenue": "3万/月",
+    "social_security": "无", "cash_buffer": "4个月", "client_concentration": "单客户60%",
+    "team_size": "1人", "education": "本科", "grad_year": "2022", "order_cycle": "1-3个月/单",
+    "has_materials": "营业执照,身份证",
+}
+
+
+def _search_result_to_policy(r: dict) -> dict | None:
+    """搜索结果 → 可入库 policy dict（带真实来源 URL，供一键入库）。
+
+    标题即为政策名（截断 50 字）；detail 是官方原文提炼的金额/资格/材料。
+    入库后 data_status 标「导入数据·待核对」——不污染政策机会指数（零造假）。
+    """
+    title = (r.get("title") or "").strip()
+    if not title or not _policy_name_ok(title):
+        return None
+    detail = r.get("detail", {}) or {}
+    return {
+        "name": title[:50],
+        "region": "",
+        "category": "实时搜索",
+        "amount": detail.get("amount", "以官方文件为准"),
+        "eligibility": detail.get("eligibility") or ["以官方文件为准"],
+        "materials": [{"name": m, "required": True}
+                      for m in (detail.get("materials") or ["以当地官方要求为准"])],
+        "source": (r.get("url") or "搜索引擎结果")[:80],
+        "source_url": r.get("url") or "",
+        "difficulty": "待评估",
+        "timing": "以当地官方为准",
+        "key_point": "实时搜索获得，入库前请人工核对与官方原文一致",
+        "update_date": "2026-08",
+    }
+
+
+def _format_opc_results(region: str, results: list[dict]) -> str:
+    """把搜索结果格式化成报告段落（官方优先、来源可溯源、结构化要素）。"""
+    lines = [f"🔍 **实时搜索「{region}」政策结果**（来源：网页搜索，官方优先，需点开核验）："]
+    for r in results[:6]:
+        tag = {"官方": "🏛 官方", "信息平台": "📄 信息平台", "需核验": "🔗 第三方"}.get(r.get("official"), "")
+        line = f"- {tag} **{r['title']}**\n  · [查看来源]({r['url']})"
+        if r.get("snippet"):
+            line += f"\n  · {r['snippet']}"
+        detail = r.get("detail", {}) or {}
+        if detail.get("amount"):
+            line += f"\n  · 💰 {detail['amount']}"
+        if detail.get("eligibility"):
+            line += f"\n  · ✅ 资格：{'；'.join(detail['eligibility'][:2])}"
+        if detail.get("materials"):
+            line += f"\n  · 📋 材料：{'、'.join(detail['materials'])}"
+        lines.append(line)
+    lines.append("\n> 以上为搜索引擎实时结果，🏛官方来源可作申请依据；💰/✅/📋 为抓取原文提炼，具体以官方最新文件为准。")
+    lines.append("> 💡 若某条正是你需要的政策，点下方「✅ 一键入库」保存到本地库（离线也能用）。入库前请人工核对与官方原文一致。")
+    return "\n".join(lines)
+
+
+def do_dyn_search(region: str, keyword: str, desc: str):
+    """Tab⑤ 政策动态搜索：三档搜索词（用户关键词 > 描述提炼 > 自动热点词）。
+
+    返回 (展示md, 可入库policies, 地区code, 状态信息)。
+    """
+    region = (region or "杭州").strip()
+    keyword = (keyword or "").strip()
+    desc = (desc or "").strip()
+    llm_fn = api_client.generate if api_client.is_api_available() else None
+
+    # 用户留空关键词但填了描述 → 先用 AI 提炼关键词（有 LLM 时）
+    if not keyword and desc and llm_fn is not None:
+        kw = policy_searcher.generate_keyword_from_desc(desc, region, llm_fn)
+        if kw:
+            keyword = kw
+    if not keyword and desc and llm_fn is None:
+        # 无 LLM：给出提示，仍用自动词搜索
+        pass
+
+    results = policy_searcher.search_opc_policies(region, keyword, _PHOTOGRAPHER_PROFILE, llm_fn)
+    if not results:
+        return policy_searcher.unavailable_notice(region), [], region, "搜索无结果（网络受限或该地区政策较少）"
+
+    md = _format_opc_results(region, results)
+    # 构造可入库 policy（官方来源优先，取前 5 条）
+    pols = []
+    for r in results:
+        p = _search_result_to_policy(r)
+        if p and len(pols) < 5:
+            pols.append(p)
+    status = f"搜到 {len(results)} 条结果，其中 {len(pols)} 条可入库"
+    return md, pols, region, status
+
+
+def do_import_searched(policies: list, region: str):
+    """Tab⑤ 一键入库：把实时搜索到的政策写入本地库（用户手动确认后）。
+
+    复用 import_policy 的 _write_policies_file + _register_region（热注册免重启）。
+    返回 (msg, 地区名, 地区code)。
+    """
+    region = (region or "").strip()
+    if not policies:
+        return "暂无搜到的政策可入库，请先在上方搜索。", None, None
+    pols = [p for p in policies if _policy_name_ok(p.get("name", ""))]
+    if not pols:
+        return "搜索结果的名称不规范，无法入库（已过滤垃圾/纯数字名）。", None, None
+    n = _write_policies_file(region, pols)
+    return (f"✅ 已入库 **{n} 条**到「{region}」（实时搜索结果，data_status 标「导入数据·待核对」）\n\n"
+            f"已自动切换地区到「{region}」，本次会话即可用（重启后仍生效）。\n\n"
+            f"⚠️ 入库内容来自网页搜索，请**人工核对**与官方原文一致。",
+            region, _slug(region))
+
+
+def compare_regions(region_a: str, region_b: str) -> str:
+    """Tab⑤ 地区对比：同一经营画像，对比两地区政策机会/健康/可申请政策。
+
+    已收录地区（温州）用规则引擎真实计算；未收录地区（杭州等）政策机会为 0，
+    明确提示靠「政策动态」实时搜索获取——零造假，不预置。
+    """
+    region_a = (region_a or "温州").strip()
+    region_b = (region_b or "杭州").strip()
+    p = bp.empty_profile()
+    p.update(_PHOTOGRAPHER_PROFILE)
+    p["region"] = region_a
+
+    def _col(region: str) -> dict:
+        code = _region_code(region)
+        idx = compute_indices(p, code)
+        info = region_info(code)
+        names = "、".join(idx["policy_names_local"][:3]) or "暂无（未收录→实时搜索）"
+        return {
+            "status": info.get("data_status", ""),
+            "opp": idx["policy_opportunity"],
+            "health": idx["health"],
+            "names": names,
+            "code": code,
+        }
+
+    a, b = _col(region_a), _col(region_b)
+    lines = [
+        "### 🔁 地区对比（同一经营画像）",
+        "**画像**：个体工商户 · 摄影 · 2年 · 月入3万 · 无社保 · 本科(2022毕业)",
+        "",
+        "| 维度 | " + region_a + " | " + region_b + " |",
+        "|------|------|------|",
+        f"| 数据状态 | {a['status']} | {b['status']} |",
+        f"| 政策机会 | **{a['opp']}** 项 | **{b['opp']}** 项 |",
+        f"| 健康指数 | {a['health']} | {b['health']} |",
+        f"| 可申请 | {a['names']} | {b['names']} |",
+        "",
+    ]
+    lines.append("> 📌 **未收录地区**（data_status 含「需核验」）政策机会为 0——政策靠上方「政策动态」实时搜索获取，"
+                 "不是系统漏算。国家级通用政策（小型微利/增值税/六税两费）两地区都自动享受。")
+    if "真实" not in a["status"]:
+        lines.append(f"> 💡 想对比「{region_a}」实际能申什么？在上方搜政策 → 一键入库，政策机会立刻变真实数字。")
+    elif "真实" not in b["status"]:
+        lines.append(f"> 💡 想对比「{region_b}」实际能申什么？在上方搜政策 → 一键入库，政策机会立刻变真实数字。")
+    return "\n".join(lines)
+
+
+def suggest_compliance_questions() -> str:
+    """合规问答「💡 让模型推荐该问的问题」：LLM 生成 3 个建议问题。
+
+    有 key → 模型基于合规知识概览生成（不硬编码）；无 key → 降级固定 3 个通用问题。
+    返回 markdown 文本（显示在 Chatbot 里）。
+    """
+    fixed = (
+        "1. **一人公司报税有什么要注意的？**\n"
+        "2. **小规模纳税人月销售额多少免征增值税？**\n"
+        "3. **个体户没交社保，影响申请补贴吗？**\n"
+    )
+    if not api_client.is_api_available():
+        return "💡 **建议从这些问题开始问**（未配置 LLM API，以下为通用建议）：\n\n" + fixed
+    try:
+        sys_p = (
+            "你是「枫独·OPC经营助手」。根据以下合规知识概览，为一名一人公司/个体户创业者"
+            "推荐 3 个最值得问的经营/税务/合规问题。\n"
+            "要求：\n1. 贴近一人公司场景（税务/社保/补贴/合同）\n"
+            "2. 每个问题一句话、口语化\n"
+            "3. 只输出问题清单，编号 1/2/3，不要解释\n\n"
+            f"知识概览：{agent_prompts.COMPLIANCE_KNOWLEDGE[:300]}"
+        )
+        content, _ = api_client.chat(
+            [{"role": "system", "content": sys_p},
+             {"role": "user", "content": "推荐 3 个问题"}],
+            max_tokens=200)
+        content = (content or "").strip()
+        if len(content) >= 10:
+            return "💡 **模型推荐的问题**（点上方问题输入框直接问）：\n\n" + content
+    except Exception:
+        pass
+    return "💡 **建议从这些问题开始问**：\n\n" + fixed
+
+
 # ---------------------------------------------------------------- 页面布局
 def build_ui():
-    regions = available_regions()
-    region_choices = [(REGION_LABELS.get(r, r), r) for r in regions]
-
     # 顶栏：Logo 图优先，横幅背景优先；缺失回退 emoji + 渐变
     logo_html = (f'<img src="{LOGO_B64}" class="brand-logo-img" alt="枫独"/>'
                  if LOGO_B64 else '<div class="brand-logo">🍁</div>')
@@ -1327,7 +1710,7 @@ def build_ui():
               <div class="brand-title">枫独 · OPC 经营助手</div>
               <div class="brand-sub">让一人公司把公司开明白 —— AI+金融 · 材料预审 / 经营诊断 / 合规问答</div>
             </div>
-            <div class="region-pill" id="region-pill">地区可切换</div>
+            <div class="region-pill" id="region-pill">地区可输入</div>
           </div>
         </div>
         """)
@@ -1341,12 +1724,17 @@ def build_ui():
         </div>
         """)
 
-        region_dd = gr.Dropdown(choices=region_choices, value="wenzhou",
-                                label="📍 经营地区（不同地区政策不同）",
-                                info="切换地区：国家级通用政策始终生效，地区政策跟随切换。可直接输入任意城市/省份（未收录地区仅匹配全国通用政策，可在④导入政策）",
-                                container=False,
-                                elem_classes="region-dd",
-                                allow_custom_value=True)
+        # 2026-08-07 UI 调整：地区选择器从下拉改为纯输入框（评委需求），功能不变——
+        # 输入任意城市/省份即切换地区（回车生效），政策跟随；温州/杭州自动映射已收录库，
+        # 其他地区走实时搜索 + 通用兜底。
+        # region_state 存当前生效地区 code，供诊断 Tab 共享（诊断不再单独设地区下拉）。
+        region_input = gr.Textbox(value="温州",
+                                  label="📍 经营地区（输入城市/省份即切换，不同地区政策不同）",
+                                  info="输入任意城市/省份（如：温州 / 杭州 / 重庆）→ 回车生效：国家级通用政策始终生效，地区政策跟随切换。未收录地区自动实时搜索当地政策，可在④导入政策。",
+                                  container=False,
+                                  elem_classes="region-dd",
+                                  placeholder="如：温州 / 杭州 / 重庆 / 北京")
+        region_state = gr.State("wenzhou")
 
         with gr.Tabs():
             # ---------- Tab1 材料预审 ----------
@@ -1369,27 +1757,34 @@ def build_ui():
                 chat_state = gr.State([])
 
                 send_btn.click(process_chat,
-                               [chat_input, profile_state, chat_state, region_dd],
-                               [chat_input, profile_state, region_dd, chatbot, cockpit, status])
+                               [chat_input, profile_state, chat_state, region_input],
+                               [chat_input, profile_state, region_input, chatbot, cockpit, status])
                 chat_input.submit(process_chat,
-                                  [chat_input, profile_state, chat_state, region_dd],
-                                  [chat_input, profile_state, region_dd, chatbot, cockpit, status])
+                                  [chat_input, profile_state, chat_state, region_input],
+                                  [chat_input, profile_state, region_input, chatbot, cockpit, status])
 
                 def on_region_change(region, profile):
-                    """切换地区 → 同步 profile 地区 + 立即重算驾驶舱（地区标题/政策跟随）。"""
+                    """输入地区（回车/失焦）→ 同步 profile 地区 + 更新共享地区 code + 立即重算驾驶舱。
+
+                    region 可能是中文（温州）或 code（wenzhou）；profile['region'] 存展示名，
+                    region_state 存 code（供诊断 Tab 共享），render_cockpit 用展示名保持标题正确。
+                    """
                     profile = profile or bp.empty_profile()
-                    region = region or "wenzhou"
-                    # region 可能是 code（wenzhou）或中文自定义（重庆）；存中文展示名
+                    region = region or "温州"
                     profile["region"] = REGION_LABELS.get(region, region)
+                    code = _region_code(profile["region"])
                     if bp.is_complete(profile):
                         try:
-                            summ = summary(profile, region)
-                            indices = compute_indices(profile, region)
-                            return profile, render_cockpit(profile, region, indices, summ, partial=False)
+                            summ = summary(profile, code)
+                            indices = compute_indices(profile, code)
+                            return profile, render_cockpit(profile, region, indices, summ, partial=False), code
                         except Exception:
                             pass
-                    return profile, render_cockpit(profile, region, partial=True)
-                region_dd.change(on_region_change, [region_dd, profile_state], [profile_state, cockpit])
+                    return profile, render_cockpit(profile, region, partial=True), code
+                region_input.submit(on_region_change, [region_input, profile_state],
+                                    [profile_state, cockpit, region_state])
+                region_input.blur(on_region_change, [region_input, profile_state],
+                                  [profile_state, cockpit, region_state])
 
                 def do_reset():
                     return bp.empty_profile(), [], [], render_cockpit(bp.empty_profile(), "wenzhou", partial=True), "已重置"
@@ -1400,9 +1795,8 @@ def build_ui():
                 gr.Markdown("> **场景**：填写（或一键带入示例）你的经营数据，AI 输出 6 维状态向量 + 三指数 + 行动建议。")
                 with gr.Row():
                     with gr.Column(scale=5):
-                        d_region = gr.Dropdown(choices=region_choices, value="wenzhou", label="地区",
-                                               container=False, elem_classes="region-dd",
-                                               allow_custom_value=True)
+                        # 2026-08-07 UI 调整：诊断 Tab 不再单独设地区下拉——统一用顶部「经营地区」输入框
+                        # （region_state 共享，自动跟随顶部输入的地区）。
                         with gr.Row():
                             d_reg_type = gr.Textbox(label="注册类型", placeholder="个体工商户 / 一人有限责任公司")
                             d_industry = gr.Textbox(label="行业", placeholder="摄影 / 软件开发 / 餐饮…")
@@ -1422,6 +1816,7 @@ def build_ui():
                         with gr.Row():
                             diag_btn = gr.Button("🔍 开始诊断", elem_id="maple-btn")
                             prefill_btn = gr.Button("🍁 带入摄影师示例", elem_id="prefill-btn")
+                            reset_diag_btn = gr.Button("🔄 重新开始", elem_id="reset-btn", size="sm")
                         diag_note = gr.HTML()
                     with gr.Column(scale=5):
                         d_cockpit = gr.HTML(render_cockpit(bp.empty_profile(), "wenzhou", partial=True))
@@ -1447,7 +1842,8 @@ def build_ui():
                                                        "d_social", "d_buffer", "d_client", "d_team", "d_edu",
                                                        "d_grad", "d_order_cycle", "d_materials"]]
 
-                def run_diag(region, reg_type, industry, duration, revenue, social, buffer, client, team, edu, grad, order_cycle, materials):
+                def run_diag(reg_type, industry, duration, revenue, social, buffer, client, team, edu, grad, order_cycle, materials, region):
+                    # region 来自顶部共享 region_state（code，如 wenzhou / 自定义中文），诊断跟随顶部输入的地区
                     inputs = {"reg_type": reg_type, "industry": industry, "duration": duration,
                               "revenue": revenue, "social_security": social, "cash_buffer": buffer,
                               "client_concentration": client, "team_size": team, "education": edu,
@@ -1458,36 +1854,97 @@ def build_ui():
                                   [d_reg_type, d_industry, d_duration, d_revenue, d_social,
                                    d_buffer, d_client, d_team, d_edu, d_grad, d_order_cycle, d_materials])
                 diag_btn.click(run_diag,
-                               [d_region, d_reg_type, d_industry, d_duration, d_revenue,
-                                d_social, d_buffer, d_client, d_team, d_edu, d_grad, d_order_cycle, d_materials],
+                               [d_reg_type, d_industry, d_duration, d_revenue,
+                                d_social, d_buffer, d_client, d_team, d_edu, d_grad, d_order_cycle,
+                                d_materials, region_state],
                                [d_cockpit, d_report])
 
-                def on_d_region_change(region):
-                    """Tab2 切换地区 → 驾驶舱标题跟随（未收录地区显示'未收录'）。"""
-                    region = region or "wenzhou"
-                    return render_cockpit(bp.empty_profile(), region, partial=True)
-                d_region.change(on_d_region_change, [d_region], [d_cockpit])
+                def do_reset_diag():
+                    """诊断 Tab 重新开始：清空所有输入 + 重置驾驶舱与报告。"""
+                    blanks = [""] * 12
+                    return blanks + [render_cockpit(bp.empty_profile(), "wenzhou", partial=True), ""]
+                reset_diag_btn.click(do_reset_diag, None,
+                                     [d_reg_type, d_industry, d_duration, d_revenue, d_social,
+                                      d_buffer, d_client, d_team, d_edu, d_grad, d_order_cycle,
+                                      d_materials, d_cockpit, d_report])
 
             # ---------- Tab3 合规问答 ----------
             with gr.Tab("③ 经营合规问答"):
-                gr.Markdown("> **场景**：问税务/合同/开票/社保问题。已接入 AI 深度回答，离线时由内置知识库兜底。")
-                c_chat = gr.Chatbot(height=430)
+                gr.Markdown("> **场景**：问税务/合同/开票/社保问题。已接入 AI 深度回答 + 实时联网搜索，离线时由内置知识库兜底。")
+                c_chat = gr.Chatbot(height=430, label="")  # label="" 去掉 gradio 默认的 "Chatbot" 标题框
                 with gr.Row():
                     c_input = gr.Textbox(placeholder="例如：一人公司报税有什么要注意的？", scale=6, container=False)
                     c_btn = gr.Button("发送", elem_id="maple-btn", scale=1)
+                with gr.Row():
+                    c_suggest_btn = gr.Button("💡 让模型推荐该问的问题", elem_id="prefill-btn", size="sm")
+                    c_suggest_out = gr.HTML()
                 c_btn.click(compliance_chat, [c_input, c_chat], [c_chat, c_input])
                 c_input.submit(compliance_chat, [c_input, c_chat], [c_chat, c_input])
+                c_suggest_btn.click(suggest_compliance_questions, None, [c_suggest_out])
 
             # ---------- Tab4 政策导入 ----------
             with gr.Tab("④ 政策导入（多地区扩展）"):
-                gr.Markdown("> **场景**：你有某地真实政策原文 → 粘贴给 AI → 自动结构化入库该地区 → 地区下拉即可切换使用。\n\n⚠️ AI 结构化可能出错，入库后请人工核对与官方文件一致（零造假原则）。")
+                gr.Markdown("> **场景**：你有某地真实政策原文 → 粘贴给 AI → 自动结构化入库该地区 → 地区下拉即可切换使用。\n\n⚠️ AI 结构化可能出错，入库后请人工核对与官方文件一致。")
                 with gr.Row():
                     imp_region = gr.Textbox(label="目标地区", value="杭州", placeholder="如：杭州 / 北京 / 广州")
                     imp_btn = gr.Button("入库政策", elem_id="maple-btn")
                 imp_text = gr.Textbox(label="政策原文", lines=8,
                                       placeholder="粘贴政策原文（含名称、金额、资格条件、申请材料、来源）…")
                 imp_result = gr.Markdown()
-                imp_btn.click(import_policy, [imp_region, imp_text], [imp_result])
+                # 热加载：入库成功后顶部地区输入框填入库地区 + 共享 region_state 同步（本次会话即用，无需重启）
+                imp_btn.click(import_policy, [imp_region, imp_text],
+                              [imp_result, region_input, region_state])
+
+            # ---------- Tab5 政策动态 · 地区对比 ----------
+            with gr.Tab("⑤ 政策动态 · 地区对比"):
+                gr.Markdown("> **场景**：实时搜索任意地区的最新政策（官方优先、来源可溯源）。搜索词**三档**：留空用 AI 自动生成；或输入指定关键词精准搜；或描述需求让 AI 提炼关键词。搜到的政策可**一键入库**本地库，之后离线也能用。")
+                with gr.Row():
+                    with gr.Column(scale=7):
+                        dyn_region = gr.Textbox(label="地区", value="杭州",
+                                                placeholder="如：杭州 / 北京 / 重庆")
+                        dyn_keyword = gr.Textbox(label="搜索关键词（留空用 AI 自动生成）",
+                                                 placeholder="如：工位注册 / Token券 / 创业担保贷款 / 一次性创业补贴 …（留空自动）",
+                                                 info="留空 → AI 自动生成；输入 → 想搜什么就搜什么")
+                        dyn_desc = gr.Textbox(label="💬 描述你想查什么（可选，AI 提炼关键词）",
+                                              placeholder="如：我想看杭州怎么支持一人公司 / 小微企业有什么税收优惠")
+                        with gr.Row():
+                            dyn_ai_kw_btn = gr.Button("💬 AI 生成关键词", elem_id="prefill-btn")
+                            dyn_search_btn = gr.Button("🔍 开始搜索", elem_id="maple-btn")
+                        dyn_result = gr.Markdown()
+                        dyn_import_btn = gr.Button("✅ 一键入库到本地库（人工核对后）", elem_id="reset-btn")
+                        dyn_import_msg = gr.Markdown()
+                        # 隐藏态：存当前搜索结果（可入库 policies）+ 当前搜索地区
+                        dyn_policies = gr.State([])
+                        dyn_code = gr.State("hangzhou")
+                    with gr.Column(scale=5):
+                        gr.Markdown("### 🔁 地区对比（同一画像）")
+                        cmp_a = gr.Textbox(label="地区 A", value="温州", placeholder="如：温州 / 杭州")
+                        cmp_b = gr.Textbox(label="地区 B", value="杭州", placeholder="如：温州 / 杭州")
+                        cmp_btn = gr.Button("🔁 对比两地区", elem_id="maple-btn")
+                        cmp_result = gr.Markdown()
+
+                def do_ai_kw(desc, region):
+                    """描述需求 → AI 提炼搜索关键词回填。无 LLM 给提示。"""
+                    desc = (desc or "").strip()
+                    region = (region or "杭州").strip()
+                    if not desc:
+                        return "请输入你的需求描述（如：我想看杭州怎么支持一人公司）。"
+                    if not api_client.is_api_available():
+                        return "未配置 LLM API，请直接在上方「搜索关键词」框手动输入关键词。"
+                    kw = policy_searcher.generate_keyword_from_desc(
+                        desc, region, api_client.generate)
+                    if kw:
+                        return kw
+                    return "AI 未能提炼出关键词，请尝试手动输入或换一种描述。"
+
+                dyn_ai_kw_btn.click(do_ai_kw, [dyn_desc, dyn_region], [dyn_keyword])
+                dyn_search_btn.click(do_dyn_search,
+                                     [dyn_region, dyn_keyword, dyn_desc],
+                                     [dyn_result, dyn_policies, dyn_code, dyn_import_msg])
+                dyn_import_btn.click(do_import_searched,
+                                     [dyn_policies, dyn_code],
+                                     [dyn_import_msg, region_input, region_state])
+                cmp_btn.click(compare_regions, [cmp_a, cmp_b], [cmp_result])
 
         gr.HTML('<div class="footnote">🍁 枫独 · OPC 经营助手 — GOAI 无界应用大赛 AI+金融 赛道演示。'
                 '数据来源：公开政策文件（温州 OPC 创业扶持申请操作指南等）。所有输出为辅助参考，'

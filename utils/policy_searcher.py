@@ -418,15 +418,17 @@ def _query_variant(region: str, keyword: str, round_no: int) -> str:
     """生成第 round_no 轮的搜索词变体。
 
     第 1 轮用主词（可能是行业动态词）；后续轮换更精准的政策措辞，
-    覆盖"一次性创业补贴 / 就业创业补贴 / 材料"等不同表述，提高命中政策原文概率。
+    覆盖"OPC 一人公司 / 一次性创业补贴 / 材料"等不同表述，提高命中政策原文概率。
+    第 2 轮固定加入 OPC 场景词（产品定位场景词，非城市枚举）——让任意地区
+    都能搜到当地 OPC 新政（如杭州工位注册/Token券、安徽算力补贴）。
     """
     k = keyword or "创业补贴 政策"
     if round_no == 0:
         return f"{region} {k} 申请条件 2026"
     if round_no == 1:
-        return f"{region} 一次性创业补贴 申请 通知 2026"
+        return f"{region} OPC 一人公司 创业补贴 工位注册 2026"
     if round_no == 2:
-        return f"{region} 就业创业 补贴 政策 材料 2026"
+        return f"{region} {k} 材料 申请 通知 2026"
     return f"{region} 创业扶持 补贴 政策 文件 2026"
 
 
@@ -496,6 +498,93 @@ def generate_query(region: str, profile: dict | None = None, llm_fn=None) -> str
         # 行业是用户原话（如"宠物殡葬"），直接作为核心词，不查类目表
         return f"{region} {ind} 创业 补贴 政策 2026"
     return base
+
+
+def generate_keyword_from_desc(desc: str, region: str, llm_fn=None) -> str:
+    """用户描述需求 → LLM 提炼 1 条精准搜索关键词（供「💬 AI 生成关键词」按钮）。
+
+    理解任意表达（零值枚举）：用户说"我想看杭州怎么支持一人公司"→ 提炼
+    "OPC 一人公司 创业补贴 工位注册"。失败返回空串（上层提示留空用自动搜索）。
+    """
+    desc = (desc or "").strip()
+    if not desc or llm_fn is None:
+        return ""
+    try:
+        sys_p = (
+            "你是政策检索专家。用户用大白话描述想查的当地政策，请提炼 1 条精准的"
+            "搜索引擎关键词（中文）。地区：{region}。\n"
+            "要求：只输出关键词本身（不含地区名、不含'政策/补贴'等冗余前缀），"
+            "8-20 字，不要解释。\n"
+            "示例：\n"
+            "- '我想看杭州怎么支持一人公司' → OPC 一人公司 创业补贴 工位注册\n"
+            "- '帮我看看小微企业有什么税收优惠' → 小微企业 税收优惠 减免\n"
+            "- '想了解直播带货能不能申请补贴' → 直播带货 创业补贴 申请条件"
+        )
+        text, _ = llm_fn(sys_p, f"用户需求：{desc}")
+        q = (text or "").strip().split("\n")[0].strip().strip("“”\"'。")
+        if 2 <= len(q) <= 30:
+            return q
+    except Exception:
+        pass
+    return ""
+
+
+def search_opc_policies(region: str, keyword: str = "", profile: dict | None = None,
+                        llm_fn=None) -> list[dict]:
+    """OPC 场景政策搜索（搜索词三档，用户完全可控，零预置）。
+
+    搜索词优先级（零值枚举，用户驱动，不预置任何地区/行业表）：
+      1. 用户输入指定关键词 → 直接用 {region} {keyword} 2026
+      2. 无用户关键词 + LLM 可用 → 模型生成精准搜索词（理解任意表达）
+      3. 都无 → OPC 场景热点词兜底（产品定位场景词，非城市枚举）
+
+    复用 search_web（多源）+ _enrich_with_content（官方原文提取金额/资格/材料）。
+    返回 [{title, url, snippet, official, detail}]，失败返回空（上层给降级提示）。
+    """
+    region = (region or "").strip()
+    keyword = (keyword or "").strip()
+    if not region:
+        return []
+
+    # 档位 1：用户输入指定关键词（用户想搜什么就搜什么）
+    main_query = f"{region} {keyword} 2026" if keyword else ""
+
+    # 档位 2：LLM 生成精准搜索词
+    if not main_query and llm_fn is not None:
+        try:
+            sys_p = (
+                "你是政策检索专家。根据用户行业与经营信息，生成 1 条搜索引擎查询词（中文），"
+                "用于搜当地针对该行业的创业/税收/补贴政策。只输出查询词本身，不要解释。"
+                f"行业：{((profile or {}).get('industry') or '未知')}；"
+                f"注册类型：{((profile or {}).get('reg_type') or '未知')}；地区：{region}。"
+            )
+            text, _ = llm_fn(sys_p, "")
+            q = (text or "").strip().split("\n")[0].strip().strip("“”\"'。")
+            if 4 <= len(q) <= 40 and ("政策" in q or "补贴" in q or "税收" in q or "支持" in q):
+                main_query = f"{region} {q} 2026"
+        except Exception:
+            pass
+
+    # 档位 3：OPC 场景热点词兜底（产品定位场景词）
+    if not main_query:
+        ind = ((profile or {}).get("industry") or "").strip()
+        if ind:
+            main_query = f"{region} {ind} OPC 创业 补贴 政策 2026"
+        else:
+            main_query = f"{region} OPC 一人公司 创业补贴 工位注册 Token券 算力券 2026"
+
+    # 多轮补搜：主词 1 轮 + OPC 变体补搜，政策相关达标即停
+    all_results: list[dict] = []
+    for rnd in range(3):
+        query = main_query if rnd == 0 else _query_variant(region, keyword, rnd)
+        res = search_web(query)
+        if res:
+            all_results.extend(res)
+        merged = _merge_dedup(all_results)
+        relevant = [r for r in merged if _is_policy_relevant(r)]
+        if len(relevant) >= 3:
+            return _enrich_with_content(merged[:6])
+    return _enrich_with_content(_merge_dedup(all_results)[:6])
 
 
 def unavailable_notice(region: str) -> str:

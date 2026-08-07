@@ -17,8 +17,10 @@
 from __future__ import annotations
 
 import re
+from datetime import datetime
 
-CURRENT_YEAR = 2026
+# 毕业窗口等判定用当前年份。动态取，避免硬编码过一年全部失效（2026 铁律：政策以官方最新公告为准）
+CURRENT_YEAR = datetime.now().year
 
 from policies import all_policies, region_info
 
@@ -66,6 +68,28 @@ def _duration_months(duration: str) -> float | None:
     if "个月" in str(duration) or "月" in str(duration):
         return n
     return None
+
+
+def _revenue_wan(rev_text) -> float | None:
+    """把月营收文本统一转成「万元/月」口径（元/万混用会判错资格，F11 修复）。
+
+    抽取端会把「3万」存成 '3万/月'、把「8000」存成 '8000元/月'（business_profile 规则），
+    单位不一致导致 _to_num 拿到 3 与 8000 两个数量级 → 碰「应纳税所得额/月销售额」上限时错判。
+    此函数归一为万元：'3万/月'→3.0，'8000元/月'→0.8，'2.5万'→2.5。
+    """
+    if not rev_text:
+        return None
+    s = str(rev_text).strip()
+    m = re.search(r"([\d.]+)", s)
+    if not m:
+        return None
+    n = float(m.group(1))
+    if "万" in s:
+        return n          # 已是万元
+    if "元" in s or "块" in s:
+        return n / 10000  # 元 → 万元
+    # 无单位：抽取端默认按「元/月」记录（如月入8000 → 8000元/月），也按元折算
+    return n / 10000
 
 
 # ---------- 条件判定 ----------
@@ -192,7 +216,7 @@ def _check_condition(cond: str, profile: dict) -> tuple[str, str]:
         rev = p.get("revenue")
         if not rev:
             return "unknown", "需确认月营收"
-        rv = _to_num(rev)
+        rv = _revenue_wan(rev)  # 统一万元口径（F11：避免 元/万 混用判错）
         if rv is None:
             return "unknown", "营收无法解析"
         annual = rv * 12
@@ -206,12 +230,12 @@ def _check_condition(cond: str, profile: dict) -> tuple[str, str]:
         rev = p.get("revenue")
         if not rev:
             return "unknown", "需确认月营收"
-        rv = _to_num(rev)
+        rv = _revenue_wan(rev)  # 统一万元口径
         if rv is None:
             return "unknown", "营收无法解析"
         if rv <= cap:
-            return "match", f"月营收{rv:.0f}万 ≤ {cap:.0f}万"
-        return "no", f"月营收{rv:.0f}万 超过 {cap:.0f}万"
+            return "match", f"月营收{rv:.1f}万 ≤ {cap:.0f}万"
+        return "no", f"月营收{rv:.1f}万 超过 {cap:.0f}万"
 
     if "人数不超过" in cond:
         m = re.search(r"不超过\s*([\d.]+)\s*人", cond)
@@ -471,6 +495,7 @@ def build_checklist(profile: dict, region: str) -> list[dict]:
                 "format_note": mat.get("format_note", ""),
                 "policy_id": mr["policy"]["id"],
                 "policy_name": mr["policy"]["name"],
+                "source": mr["policy"].get("source", ""),  # 来源机构（驾驶舱"去哪办"提示，F19）
             })
     # 排序：缺失 > 待确认 > 已备 > 自动（自动项不参与待办统计）
     order = {"缺失": 0, "待确认": 1, "已备": 2, "自动": 3}

@@ -20,6 +20,13 @@ echo [1/3] Checking dependencies...
 pip install -r requirements.txt -q
 echo Dependencies OK.
 
+REM ==== 可选：配置 LLM API key（AI 语义理解/精准搜索词/合规问答深度增强）====
+REM 取消下一行注释并填上你的 ModelScope key（https://modelscope.cn 免费获取）
+REM set MODELSCOPE_API_KEY=ms-xxxxxxxx
+REM ==== 可选：配置搜索 API（更稳定）====
+REM set BING_SEARCH_API_KEY=your_bing_key
+REM set SEARXNG_URL=http://127.0.0.1:8080
+
 start "" http://localhost:7860
 
 echo [2/3] Starting server...
